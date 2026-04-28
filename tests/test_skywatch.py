@@ -619,5 +619,264 @@ class TestMongoStoreOptionalImport(unittest.TestCase):
         self.assertIn("ABC123", eng.aircraft)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Edge ↔ central transport: spool, ABC, WS round-trip, central merger.
+# Mongo-mode tests are covered by the integration suite (need a live RS).
+# ─────────────────────────────────────────────────────────────────────
+
+class TestEdgeSpool(unittest.TestCase):
+    """SQLite-backed FIFO with size cap.  These all run in tmpdirs so
+    nothing leaks between tests."""
+
+    def setUp(self):
+        self._spools_to_cleanup: list = []
+
+    def tearDown(self):
+        for sp, tmp in self._spools_to_cleanup:
+            try:
+                sp.close()
+            except Exception:
+                pass
+            try:
+                tmp.cleanup()
+            except Exception:
+                pass
+
+    def _spool(self, max_rows=10):
+        import tempfile, os
+        from skywatch.edge.spool import Spool
+        tmp = tempfile.TemporaryDirectory()
+        sp = Spool(os.path.join(tmp.name, "s.sqlite"), max_rows=max_rows)
+        self._spools_to_cleanup.append((sp, tmp))
+        return sp
+
+    def test_fifo_eviction_on_overflow(self):
+        sp = self._spool(max_rows=5)
+        for i in range(8):
+            sp.enqueue({"gen": i, "type": "aircraft",
+                        "receiver_id": "rx1", "ts": 0.0, "payload": {}})
+        self.assertEqual(sp.count(), 5)
+        self.assertEqual(sp.dropped, 3)
+        rows = sp.peek_batch(10)
+        self.assertEqual([r[1]["gen"] for r in rows], [3, 4, 5, 6, 7])
+        sp.close()
+
+    def test_pop_drains_in_order(self):
+        sp = self._spool(max_rows=10)
+        for i in range(5):
+            sp.enqueue({"gen": i, "type": "aircraft",
+                        "receiver_id": "rx1", "ts": 0.0, "payload": {}})
+        rows = sp.peek_batch(3)
+        sp.pop_to(rows[-1][0])
+        self.assertEqual(sp.count(), 2)
+        rows = sp.peek_batch(10)
+        self.assertEqual([r[1]["gen"] for r in rows], [3, 4])
+        sp.close()
+
+    def test_corrupt_row_dropped_silently(self):
+        # Direct sqlite insert of a row that isn't valid JSON; peek
+        # should drop it and continue.
+        import tempfile, os, sqlite3
+        from skywatch.edge.spool import Spool
+        with tempfile.TemporaryDirectory() as d:
+            sp = Spool(os.path.join(d, "s.sqlite"), max_rows=10)
+            sp.enqueue({"gen": 1, "type": "aircraft",
+                        "receiver_id": "rx", "ts": 0.0, "payload": {}})
+            # Inject a garbage row by hand.
+            sp._conn.execute(
+                "INSERT INTO deltas(payload) VALUES ('not-json')",
+            )
+            sp.enqueue({"gen": 2, "type": "aircraft",
+                        "receiver_id": "rx", "ts": 0.0, "payload": {}})
+            rows = sp.peek_batch(10)
+            # Corrupt one is silently dropped; valid ones remain in order.
+            self.assertEqual([r[1]["gen"] for r in rows], [1, 2])
+            sp.close()
+
+
+class TestTransportContract(unittest.TestCase):
+    """Both transport implementations must conform to the same Transport
+    ABC surface (start/stop/send/subscribe)."""
+
+    def test_abc_methods_present(self):
+        from skywatch.transport import Transport
+        # Concrete implementations subclass Transport and implement all
+        # abstract methods (would error on instantiation otherwise).
+        from skywatch.transport.websocket_push import WebSocketPushTransport
+        self.assertTrue(issubclass(WebSocketPushTransport, Transport))
+        # Mongo subclass is gated on pymongo availability.
+        try:
+            import pymongo  # noqa: F401
+            from skywatch.transport.mongo_changestream import (
+                MongoChangeStreamTransport,
+            )
+            self.assertTrue(issubclass(MongoChangeStreamTransport, Transport))
+        except ImportError:
+            self.skipTest("pymongo not installed")
+
+    def test_websocket_round_trip(self):
+        """Real edge → central round-trip on localhost.  Uses a random
+        free port to avoid clashing with anything else."""
+        import socket, threading, time
+        from skywatch.transport import Delta
+        from skywatch.transport.websocket_push import WebSocketPushTransport
+
+        # Find a free port
+        s = socket.socket(); s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]; s.close()
+
+        received: list[Delta] = []
+        central = WebSocketPushTransport(
+            bind=f"127.0.0.1:{port}", path="/ingest", token="test-secret",
+        )
+        central.start()
+        central.subscribe(received.append)
+
+        edge = WebSocketPushTransport(
+            central_url=f"ws://127.0.0.1:{port}/ingest",
+            token="test-secret",
+        )
+        edge.start()
+
+        # Wait for the edge to handshake.  Polling beats sleep().
+        deadline = time.time() + 3.0
+        while edge.sent_total == 0 and time.time() < deadline:
+            edge.send(Delta("aircraft", "rx-test", 1, {"icao": "ABCDEF"}))
+            time.sleep(0.05)
+        # And wait for the central to receive.
+        deadline = time.time() + 3.0
+        while not received and time.time() < deadline:
+            time.sleep(0.05)
+        edge.stop(); central.stop()
+
+        self.assertGreaterEqual(len(received), 1)
+        self.assertEqual(received[0].receiver_id, "rx-test")
+        self.assertEqual(received[0].payload.get("icao"), "ABCDEF")
+
+
+class TestCentralMerger(unittest.TestCase):
+    """Verify the merger's gen-tracking and aircraft-merge behaviour."""
+
+    def _bind_merger(self):
+        from skywatch.central.merger import CentralMerger
+        from skywatch.state import StateEngine
+        eng = StateEngine()
+        return CentralMerger(eng), eng
+
+    def test_aircraft_delta_creates_and_updates(self):
+        from skywatch.transport import Delta, DELTA_TYPE_AIRCRAFT
+        m, eng = self._bind_merger()
+        d = Delta(DELTA_TYPE_AIRCRAFT, "rx1", 1, {
+            "icao": "ABCDEF", "callsign": "TEST1",
+            "lat": 51.5, "lon": -0.5, "alt_baro_ft": 35000,
+            "last_seen": 100.0, "first_seen": 90.0,
+            "by_receiver": {"rx1": {
+                "rssi": -42.0, "rssi_samples": 7,
+                "msg_counts": {"17": 5, "11": 2},
+                "first_seen": 90.0, "last_seen": 100.0,
+                "gen": 7,
+            }},
+        })
+        m.apply_delta(d)
+        self.assertIn("ABCDEF", eng.aircraft)
+        ac = eng.aircraft["ABCDEF"]
+        self.assertEqual(ac.callsign, "TEST1")
+        self.assertEqual(ac.lat, 51.5)
+        self.assertIn("rx1", ac.by_receiver)
+        self.assertEqual(ac.by_receiver["rx1"].rssi_avg, -42.0)
+        self.assertEqual(ac.by_receiver["rx1"].rssi_samples, 7)
+
+    def test_gen_gap_increments_counter(self):
+        from skywatch.transport import Delta, DELTA_TYPE_AIRCRAFT
+        m, _ = self._bind_merger()
+        for gen in (1, 2, 5):  # gap of 2 between 2→5
+            m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx1", gen,
+                                {"icao": "ABCDEF"}))
+        self.assertEqual(m.gen_gaps, 2)
+
+    def test_gen_reset_treated_as_edge_restart(self):
+        from skywatch.transport import Delta, DELTA_TYPE_AIRCRAFT
+        m, _ = self._bind_merger()
+        # Big run then a reset to 1 — should not be a gap.
+        for gen in (1, 2, 3, 4, 200, 1, 2):
+            m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx1", gen,
+                                {"icao": "ABCDEF"}))
+        self.assertEqual(m.gen_resets, 1)
+
+    def test_two_receivers_merge_into_one_aircraft(self):
+        from skywatch.transport import Delta, DELTA_TYPE_AIRCRAFT
+        m, eng = self._bind_merger()
+        m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx1", 1, {
+            "icao": "ABCDEF",
+            "by_receiver": {"rx1": {"rssi": -42.0, "rssi_samples": 1,
+                                    "msg_counts": {}, "first_seen": 1.0,
+                                    "last_seen": 1.0, "gen": 1}},
+        }))
+        m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx2", 1, {
+            "icao": "ABCDEF",
+            "by_receiver": {"rx2": {"rssi": -28.0, "rssi_samples": 1,
+                                    "msg_counts": {}, "first_seen": 2.0,
+                                    "last_seen": 2.0, "gen": 1}},
+        }))
+        ac = eng.aircraft["ABCDEF"]
+        self.assertEqual(set(ac.by_receiver), {"rx1", "rx2"})
+        self.assertEqual(ac.by_receiver["rx1"].rssi_avg, -42.0)
+        self.assertEqual(ac.by_receiver["rx2"].rssi_avg, -28.0)
+
+
+class TestEdgeRunner(unittest.TestCase):
+    """End-to-end edge: feed it via the synthetic scenario and assert
+    the transport receives properly-shaped deltas."""
+
+    def test_edge_emits_aircraft_deltas(self):
+        # In-memory transport stub — implements the ABC and just records.
+        from skywatch.transport import Transport, Delta, DELTA_TYPE_AIRCRAFT
+
+        class CaptureTransport(Transport):
+            def __init__(self):
+                self.deltas: list[Delta] = []
+            def start(self): pass
+            def stop(self): pass
+            def send(self, d):
+                self.deltas.append(d); return True
+            def subscribe(self, cb): pass
+
+        from skywatch.edge.runner import EdgeRunner
+        from skywatch.decoder.synthetic import (
+            make_df11_squitter, make_airborne_position,
+        )
+
+        cap = CaptureTransport()
+        # We don't actually run the BEAST socket loop here; we drive the
+        # engine directly via a parser to keep the test fast and
+        # offline.  The runner's transport-bridging path is what matters.
+        runner = EdgeRunner(
+            receiver_id="rx-edge", beast_host="unused", beast_port=0,
+            transport=cap, receiver_lat=51.4775, receiver_lon=-0.4614,
+        )
+        # The runner subscribes to the engine's listeners on construction;
+        # do not call start() so we skip the BEAST thread.
+        p = BeastParser(receiver_id="rx-edge")
+        for raw in (
+            make_df11_squitter("ABC123"),
+            make_airborne_position("ABC123", 51.5, -0.5, 35000, even=True),
+            make_airborne_position("ABC123", 51.5, -0.5, 35000, even=False),
+        ):
+            for f in p.feed(encode_beast(raw, ts_seconds=1.0)):
+                runner.engine.feed(f)
+        # The first delta is the receiver registration
+        # ('_push_receiver_state' invoked from runner.__init__ — no, it's in
+        # start()).  Since we skipped start(), aircraft deltas are all we have.
+        ac_deltas = [d for d in cap.deltas if d.type == DELTA_TYPE_AIRCRAFT]
+        self.assertGreater(len(ac_deltas), 0,
+            "edge runner should ship at least one aircraft delta")
+        # Every delta must be tagged with our receiver_id and have
+        # monotonic gen counters.
+        gens = [d.gen for d in cap.deltas]
+        self.assertEqual(gens, sorted(gens))
+        for d in cap.deltas:
+            self.assertEqual(d.receiver_id, "rx-edge")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

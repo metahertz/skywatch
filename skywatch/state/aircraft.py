@@ -23,12 +23,21 @@ class TcasEvent:
 class ReceiverAttribution:
     """Per-receiver counters for one aircraft.  Lets the UI show 'this
     aircraft was heard by RX home with -42 dBFS, by RX office with -28
-    dBFS' and detect coverage gaps when one feed drops."""
+    dBFS' and detect coverage gaps when one feed drops.
+
+    `gen` is a monotonic counter incremented every time this attribution
+    is updated.  In edge-mode deployments, the central merger compares
+    incoming `gen` values against the last one it saw for the same
+    (icao, receiver_id) pair to detect dropped/reordered deltas.  In
+    monolithic mode it's harmless (just bumps locally and is never
+    inspected).
+    """
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     msg_counts: dict = field(default_factory=lambda: defaultdict(int))
     rssi_avg: float = -100.0
     rssi_samples: int = 0
+    gen: int = 0
 
     def update(self, timestamp: float, df: int, rssi: float) -> None:
         self.last_seen = timestamp
@@ -38,6 +47,7 @@ class ReceiverAttribution:
         else:
             self.rssi_avg = 0.9 * self.rssi_avg + 0.1 * rssi
         self.rssi_samples += 1
+        self.gen += 1
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +56,7 @@ class ReceiverAttribution:
             "msg_counts": dict(self.msg_counts),
             "rssi": self.rssi_avg,
             "rssi_samples": self.rssi_samples,
+            "gen": self.gen,
         }
 
 
