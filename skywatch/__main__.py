@@ -16,6 +16,7 @@ from pathlib import Path
 from skywatch.db import InfoLookup, MictronicsDB
 from skywatch.db.mictronics import DEFAULT_DB_PATH
 from skywatch.db.seed import SEED_PATH
+from skywatch.enrich import RouteResolver
 from skywatch.server import AppServer, StaticServer, WebSocketServer
 from skywatch.state import StateEngine
 
@@ -68,6 +69,13 @@ def main(argv=None) -> int:
         help="Synthetic feed time scale (>1 = faster than real time)",
     )
     parser.add_argument(
+        "--route-enrichment", action="store_true",
+        help="Enable callsign → origin/destination lookups via the public "
+             "adsbdb.com API at startup.  Each lookup leaks the callsign "
+             "(and your IP) to the third party, so it is off by default. "
+             "Can also be toggled at runtime from the web UI.",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="DEBUG logging",
     )
     args = parser.parse_args(argv)
@@ -110,6 +118,14 @@ def main(argv=None) -> int:
         info_lookup=info_lookup,
     )
 
+    # ---- Route enrichment (adsbdb.com) ----
+    route_resolver = RouteResolver(
+        on_route=engine.apply_route,
+        enabled=args.route_enrichment,
+    )
+    engine.route_resolver = route_resolver
+    route_resolver.start()
+
     # ---- Servers ----
     ws_host, ws_port = _parse_endpoint(args.ws, 8765)
     http_host, http_port = _parse_endpoint(args.http, 8080)
@@ -147,6 +163,7 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nShutting down...")
         app.stop()
+        route_resolver.stop()
         ws.stop()
         http.stop()
         time.sleep(0.3)

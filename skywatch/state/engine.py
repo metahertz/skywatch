@@ -74,8 +74,12 @@ class StateEngine:
         receiver_lon: float | None = None,
         max_range_nm: float = DEFAULT_MAX_RANGE_NM,
         info_lookup=None,
+        route_resolver=None,
     ) -> None:
         self.aircraft: dict[str, Aircraft] = {}
+        # Optional callsign → route enrichment (adsbdb.com).  See
+        # skywatch.enrich.route.RouteResolver.  None means disabled.
+        self.route_resolver = route_resolver
         # ICAOs we've seen via squitter (DF11/17/18) recently. Used to
         # validate address-parity recoveries from short replies.
         self._squitter_roster: dict[str, float] = {}
@@ -241,12 +245,34 @@ class StateEngine:
 
     def _refresh_info(self, ac: Aircraft) -> None:
         """(Re)resolve static aircraft info; cheap because InfoLookup caches."""
-        if self.info_lookup is None:
+        if self.info_lookup is not None:
+            if ac._db_info_callsign != ac.callsign or ac.db_info is None:
+                ac.db_info = self.info_lookup.lookup(
+                    ac.icao, callsign=ac.callsign,
+                )
+                ac._db_info_callsign = ac.callsign
+        # Schedule a route lookup (adsbdb.com) when the callsign changes.
+        # The resolver is itself enable/disable-aware and idempotent, so
+        # it's cheap to call on every callsign refresh.
+        if (self.route_resolver is not None
+                and ac.callsign
+                and ac._route_callsign != ac.callsign):
+            ac._route_callsign = ac.callsign
+            self.route_resolver.request(ac.callsign)
+
+    def apply_route(self, callsign: str, route: dict | None) -> None:
+        """Callback invoked by RouteResolver when a lookup completes.
+
+        Writes the route data onto every aircraft currently carrying this
+        callsign and emits a per-aircraft update so the UI refreshes.
+        """
+        if not callsign:
             return
-        if ac._db_info_callsign == ac.callsign and ac.db_info is not None:
-            return  # nothing changed since last resolution
-        ac.db_info = self.info_lookup.lookup(ac.icao, callsign=ac.callsign)
-        ac._db_info_callsign = ac.callsign
+        cs = callsign.strip().upper()
+        for ac in self.aircraft.values():
+            if (ac.callsign or "").strip().upper() == cs:
+                ac.route = route
+                self._emit_update(ac)
 
     # -----------------------------------------------------------------
     # ADS-B handler

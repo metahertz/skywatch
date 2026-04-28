@@ -142,16 +142,50 @@ body::before {
 #conn-stat .val { color: var(--red); }
 #conn-stat.ok .val { color: var(--fg-primary); }
 
+/* Topbar toggle button (e.g. ROUTE ON/OFF).  Same shape as a .stat block
+ * so it sits inline cleanly. */
+.toggle-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  background: transparent;
+  border: 1px solid rgba(120, 200, 200, 0.15);
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  line-height: 1.05;
+  color: var(--fg-dim);
+}
+.toggle-btn .lbl { color: var(--fg-dim); font-size: 9px; letter-spacing: 0.15em; }
+.toggle-btn .val { color: var(--fg-bright); font-size: 12px; font-weight: 500; }
+.toggle-btn:hover { border-color: rgba(120, 200, 200, 0.4); }
+.toggle-btn.on {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: rgba(245, 184, 61, 0.08);
+}
+.toggle-btn.on .val { color: var(--amber-bright); }
+
 /* ─── MAIN GRID ──────────────────────────────────────────────────── */
 
 .layout {
+  /* Pane sizes are CSS variables so JS can update them on splitter drag.
+   * Defaults match the previous fixed layout. */
+  --col-list:   320px;
+  --col-detail: 360px;
+  --row-ra:     140px;
+  --split:      4px;     /* drag-handle thickness */
+
   display: grid;
-  grid-template-columns: 1fr 320px 360px;
-  grid-template-rows: 1fr 200px 140px;
+  grid-template-columns:
+    1fr var(--split) var(--col-list) var(--split) var(--col-detail);
+  grid-template-rows:
+    1fr 200px var(--split) var(--row-ra);
   grid-template-areas:
-    "map list detail"
-    "map events detail"
-    "ra ra ra";
+    "map     split-col-list  list   split-col-detail  detail"
+    "map     split-col-list  events split-col-detail  detail"
+    "split-row-ra  split-row-ra  split-row-ra  split-row-ra  split-row-ra"
+    "ra      ra              ra     ra                ra";
   gap: 0;
   height: 100%;
   min-height: 0;
@@ -162,6 +196,31 @@ body::before {
 .detail-pane { grid-area: detail; }
 .events-pane { grid-area: events; }
 .ra-pane     { grid-area: ra; }
+
+/* Splitter drag handles.  They sit in their own narrow grid tracks so
+ * the surrounding panes don't overlap.  The hairline shows on hover so
+ * the rest-state stays visually quiet. */
+.splitter {
+  background: var(--bg-pane);
+  position: relative;
+  z-index: 600;
+  user-select: none;
+  touch-action: none;
+}
+.splitter-vertical   { cursor: col-resize; }
+.splitter-horizontal { cursor: row-resize; }
+.splitter::after {
+  /* Visible affordance on hover/drag. */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+.splitter:hover::after,
+.splitter.dragging::after {
+  background: rgba(245, 184, 61, 0.35);   /* amber */
+}
 
 .list-pane, .detail-pane, .events-pane, .ra-pane {
   background: var(--bg-pane);
@@ -280,9 +339,14 @@ body::before {
 }
 
 .ac-label .lbl-cs { color: var(--fg-bright); font-weight: 600; }
+.ac-label .lbl-icao { color: var(--fg-dim); margin-left: 4px; font-size: 8.5px; }
+.ac-label .lbl-typ { color: var(--fg-primary); font-size: 9px; }
 .ac-label .lbl-alt { color: var(--cyan); }
 .ac-label .lbl-spd { color: var(--fg-primary); }
 .ac-label .lbl-vrate { color: var(--fg-dim); margin-left: 2px; }
+.ac-label .lbl-hdg { color: var(--fg-dim); margin-left: 4px; }
+.ac-label .lbl-sqk { color: var(--amber); margin-left: 4px; font-size: 9px; }
+.ac-label .lbl-route { color: var(--amber-bright); font-size: 9px; }
 
 /* Trail */
 .ac-trail {
@@ -358,6 +422,52 @@ body::before {
   color: var(--fg-dim);
 }
 
+/* Map-label field selector.  Lets the user pick which fields appear on
+ * each aircraft marker label.  Renders as a <details> disclosure so it
+ * stays collapsed until needed. */
+.label-fields {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: var(--hairline);
+}
+.label-fields > summary {
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: var(--fg-dim);
+  cursor: pointer;
+  list-style: none;
+}
+.label-fields > summary::-webkit-details-marker { display: none; }
+.label-fields > summary:hover { color: var(--amber); }
+.label-fields-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 10px;
+  margin-top: 6px;
+}
+.label-fields-grid label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  color: var(--fg-primary);
+  cursor: pointer;
+  letter-spacing: 0.05em;
+}
+.label-fields-grid input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgba(120, 200, 200, 0.4);
+  background: var(--bg-cell);
+  cursor: pointer;
+}
+.label-fields-grid input[type="checkbox"]:checked {
+  background: var(--amber);
+  border-color: var(--amber);
+}
+
 /* ─── LIST PANE ──────────────────────────────────────────────────── */
 
 .list-head {
@@ -388,7 +498,9 @@ body::before {
 
 .list-cols, #aircraft-list li {
   display: grid;
-  grid-template-columns: 60px 70px 50px 50px 45px 40px;
+  /* FLT column is flex (minmax) so it can grow with the pane and host
+   * the inline "ORIG→DEST" route tag without breaking the columns. */
+  grid-template-columns: 60px minmax(70px, 1fr) 50px 50px 45px 40px;
   gap: 6px;
   padding: 3px 12px;
   font-size: 11px;
@@ -428,7 +540,29 @@ body::before {
 }
 
 #aircraft-list .icao { color: var(--fg-dim); }
-#aircraft-list .cs   { color: var(--fg-bright); font-weight: 500; }
+#aircraft-list .cs   {
+  color: var(--fg-bright);
+  font-weight: 500;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;     /* let children truncate inside grid track */
+  overflow: hidden;
+}
+#aircraft-list .cs-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#aircraft-list .cs-route {
+  color: var(--amber);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 #aircraft-list .typ  { color: var(--fg-primary); }
 #aircraft-list .fl   { color: var(--cyan); font-variant-numeric: tabular-nums; }
 #aircraft-list .gs   { color: var(--fg-primary); font-variant-numeric: tabular-nums; }
@@ -723,6 +857,45 @@ body::before {
   font-weight: 500;
 }
 
+/* Route enrichment row.  Shown in the detail header when adsbdb.com has
+ * returned origin/destination data for this aircraft's callsign. */
+.detail-route {
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: var(--fg-primary);
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.detail-route .ap {
+  color: var(--fg-bright);
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+}
+.detail-route .ap-name {
+  color: var(--fg-dim);
+  font-size: 9.5px;
+}
+.detail-route .arrow {
+  color: var(--amber);
+  font-size: 11px;
+  margin: 0 2px;
+}
+.detail-route .src-pill {
+  margin-left: auto;
+  font-size: 8.5px;
+  color: var(--fg-faint);
+  border-color: rgba(120, 200, 200, 0.15);
+}
+.detail-route .airline {
+  width: 100%;
+  color: var(--fg-dim);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+}
+
 /* Compact-view footer: tiny one-liner replacing the BDS-pills /
  * DF-counts sections that the VERBOSE view shows in full. */
 .detail-footer {
@@ -868,11 +1041,13 @@ body::before {
 
 @media (max-width: 1100px) {
   .layout {
-    grid-template-columns: 1fr 320px;
+    grid-template-columns: 1fr var(--col-list);
+    grid-template-rows: 1fr 200px var(--row-ra);
     grid-template-areas:
       "map list"
       "map events"
       "ra ra";
   }
-  .detail-pane { display: none; }
+  .detail-pane,
+  .splitter { display: none; }
 }

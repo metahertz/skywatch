@@ -25,10 +25,24 @@
         <div class="stat"><span class="lbl">DROP</span><span class="val" id="stat-drop">0</span></div>
         <div class="stat"><span class="lbl">A/C</span><span class="val" id="stat-aircraft">0</span></div>
         <div class="stat" id="conn-stat"><span class="lbl">LINK</span><span class="val">DISCONN</span></div>
+        <button class="toggle-btn" id="route-toggle" hidden
+                title="Look up origin/destination airports via adsbdb.com. Each lookup transmits the callsign to the third-party API.">
+          <span class="lbl">ROUTE</span><span class="val">OFF</span>
+        </button>
       </div>
     </header>
 
-    <main class="layout">
+    <main class="layout" id="layout">
+      <!-- Drag handles for resizing the panes.  CSS positions these into
+           4-px-wide grid tracks between the existing areas; JS reads the
+           pointer movement and updates the column/row CSS variables. -->
+      <div class="splitter splitter-vertical" data-axis="x"
+           data-var="--col-list" style="grid-area: split-col-list;"></div>
+      <div class="splitter splitter-vertical" data-axis="x"
+           data-var="--col-detail" style="grid-area: split-col-detail;"></div>
+      <div class="splitter splitter-horizontal" data-axis="y"
+           data-var="--row-ra" style="grid-area: split-row-ra;"></div>
+
       <section class="map-pane">
         <div id="map"></div>
         <div class="overlay overlay-tl">
@@ -40,6 +54,20 @@
             <div class="legend-row"><span class="lc lc-fl4">▰</span> &gt; FL400</div>
             <div class="legend-row"><span class="lc lc-ra">▰</span> TCAS RA</div>
           </div>
+          <details class="label-fields" id="label-fields">
+            <summary>MAP LABEL ▾</summary>
+            <div class="label-fields-grid">
+              <label><input type="checkbox" data-field="callsign"> CALLSIGN</label>
+              <label><input type="checkbox" data-field="icao"> ICAO</label>
+              <label><input type="checkbox" data-field="type"> TYPE</label>
+              <label><input type="checkbox" data-field="fl"> FL</label>
+              <label><input type="checkbox" data-field="vrate"> V/S</label>
+              <label><input type="checkbox" data-field="gs"> GS</label>
+              <label><input type="checkbox" data-field="hdg"> TRACK</label>
+              <label><input type="checkbox" data-field="squawk"> SQK</label>
+              <label><input type="checkbox" data-field="route"> ROUTE</label>
+            </div>
+          </details>
         </div>
         <div class="overlay overlay-bl">
           <div class="rx-info" id="rx-info">RX: not configured</div>

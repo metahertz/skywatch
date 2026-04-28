@@ -18,6 +18,13 @@
     frameTimes: [],          // sliding window for rate calc
     filterText: '',
     detailMode: localStorage.getItem('skywatch.detailMode') || 'compact',
+    config: { route_enrichment: false, route_enrichment_available: false },
+    // Map-marker label fields.  Persisted per-browser.  Default mirrors
+    // the original (callsign + FL + V/S + GS) so existing users see no
+    // change after upgrading.
+    labelFields: new Set(JSON.parse(
+      localStorage.getItem('skywatch.labelFields') ||
+      '["callsign","fl","vrate","gs"]')),
   };
 
   // ─── DOM ────────────────────────────────────────────────────────────
@@ -27,6 +34,7 @@
     detail: document.getElementById('detail-pane'),
     detailContent: document.getElementById('detail-content'),
     eventLog: document.getElementById('event-log'),
+    routeToggle: document.getElementById('route-toggle'),
     raTimeline: document.getElementById('ra-timeline'),
     raCount: document.getElementById('ra-count'),
     rxInfo: document.getElementById('rx-info'),
@@ -43,6 +51,102 @@
     state.filterText = el.filter.value.trim().toUpperCase();
     renderList();
   });
+
+  // ─── Pane resize splitters ──────────────────────────────────────────
+  // Each .splitter sits in its own narrow grid track between two panes
+  // (see CSS).  On drag, we update the matching CSS variable on the
+  // layout element so the grid recomputes.  Sizes persist to localStorage.
+
+  const layoutEl = document.getElementById('layout');
+
+  function loadSplitterSize(varName, fallback) {
+    const stored = localStorage.getItem('skywatch.size' + varName);
+    if (stored) layoutEl.style.setProperty(varName, stored);
+    else if (fallback) layoutEl.style.setProperty(varName, fallback);
+  }
+  loadSplitterSize('--col-list');
+  loadSplitterSize('--col-detail');
+  loadSplitterSize('--row-ra');
+
+  function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+  document.querySelectorAll('.splitter').forEach(sp => {
+    sp.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      const axis = sp.dataset.axis;        // 'x' (column) or 'y' (row)
+      const cssVar = sp.dataset.var;
+      const startCoord = (axis === 'x') ? ev.clientX : ev.clientY;
+      const startSize = parseFloat(
+        getComputedStyle(layoutEl).getPropertyValue(cssVar)) || 0;
+      sp.classList.add('dragging');
+      sp.setPointerCapture(ev.pointerId);
+
+      function onMove(e) {
+        const cur = (axis === 'x') ? e.clientX : e.clientY;
+        // Splitters live to the LEFT/TOP of the variable they control,
+        // so dragging "into" the variable's side (right or down) shrinks
+        // it.  i.e. delta and size move opposite.
+        const newSize = startSize - (cur - startCoord);
+        layoutEl.style.setProperty(cssVar, clamp(newSize, 120, 900) + 'px');
+      }
+      function onUp(e) {
+        sp.removeEventListener('pointermove', onMove);
+        sp.removeEventListener('pointerup', onUp);
+        sp.removeEventListener('pointercancel', onUp);
+        sp.classList.remove('dragging');
+        try { sp.releasePointerCapture(e.pointerId); } catch (_) {}
+        localStorage.setItem(
+          'skywatch.size' + cssVar,
+          layoutEl.style.getPropertyValue(cssVar));
+        // Leaflet caches its container size — invalidate it so tiles
+        // and markers redraw to the new dimensions.
+        if (typeof map !== 'undefined' && map.invalidateSize) {
+          map.invalidateSize();
+        }
+      }
+      sp.addEventListener('pointermove', onMove);
+      sp.addEventListener('pointerup', onUp);
+      sp.addEventListener('pointercancel', onUp);
+    });
+  });
+
+  // ─── Map-label field selector ───────────────────────────────────────
+  // Wire the checkboxes to state.labelFields and re-render markers on
+  // any change.  Initial state reflects what's stored.
+
+  document.querySelectorAll('#label-fields input[data-field]').forEach(cb => {
+    cb.checked = state.labelFields.has(cb.dataset.field);
+    cb.addEventListener('change', () => {
+      const f = cb.dataset.field;
+      if (cb.checked) state.labelFields.add(f);
+      else state.labelFields.delete(f);
+      localStorage.setItem(
+        'skywatch.labelFields',
+        JSON.stringify([...state.labelFields]));
+      // Re-render every marker with the new label set.
+      for (const ac of state.aircraft.values()) updateMarker(ac);
+    });
+  });
+
+  // Route-enrichment toggle (adsbdb.com).  Click sends the new state to
+  // the backend over the WS; the backend echoes a config message that
+  // updates this and any other connected client.
+  el.routeToggle.addEventListener('click', () => {
+    if (!state.config.route_enrichment_available) return;
+    const next = !state.config.route_enrichment;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'set_route_enrichment', enabled: next }));
+    }
+  });
+
+  function applyConfig(cfg) {
+    if (!cfg) return;
+    Object.assign(state.config, cfg);
+    el.routeToggle.hidden = !state.config.route_enrichment_available;
+    el.routeToggle.classList.toggle('on', !!state.config.route_enrichment);
+    el.routeToggle.querySelector('.val').textContent =
+      state.config.route_enrichment ? 'ON' : 'OFF';
+  }
 
   // Detail-pane view toggle: compact vs verbose+source-provenance.
   // Choice persisted in localStorage so reloads remember it.
@@ -126,19 +230,82 @@
     </svg>`;
   }
 
-  function makeMarker(ac) {
+  // Build the per-marker label HTML based on the user's selected fields.
+  // Returns the full <div class="ac-label">…</div> wrapper, or '' when
+  // nothing is selected (no label rendered).
+  function aircraftLabelHtml(ac) {
+    const f = state.labelFields;
+    const lines = [];
+
+    // Header row: callsign and/or ICAO and/or squawk
+    const header = [];
+    if (f.has('callsign') && ac.callsign) {
+      header.push(`<span class="lbl-cs">${ac.callsign}</span>`);
+    }
+    if (f.has('icao')) {
+      header.push(`<span class="lbl-icao">${ac.icao}</span>`);
+    }
+    if (f.has('squawk') && ac.squawk) {
+      header.push(`<span class="lbl-sqk">${ac.squawk}</span>`);
+    }
+    if (header.length) lines.push(`<div>${header.join('')}</div>`);
+
+    // Type code (from offline DB lookup)
+    if (f.has('type')) {
+      const t = ac.info && ac.info.type_code;
+      if (t) lines.push(`<div class="lbl-typ">${t}</div>`);
+    }
+
+    // Altitude + V/S, combined to save vertical space
+    if (f.has('fl') || f.has('vrate')) {
+      const parts = [];
+      if (f.has('fl')) parts.push(`<span class="lbl-alt">${fmtFL(ac.alt_baro_ft)}</span>`);
+      if (f.has('vrate')) parts.push(`<span class="lbl-vrate">${fmtVrate(ac.vrate_fpm)}</span>`);
+      lines.push(`<div>${parts.join('')}</div>`);
+    }
+
+    // Ground speed + track, combined
+    if (f.has('gs') || f.has('hdg')) {
+      const parts = [];
+      if (f.has('gs')) parts.push(`<span class="lbl-spd">${fmtSpeed(ac.gs_kt)}kt</span>`);
+      if (f.has('hdg')) {
+        const h = ac.track_deg != null ? ac.track_deg : ac.heading_deg;
+        parts.push(`<span class="lbl-hdg">${fmtHeading(h)}</span>`);
+      }
+      lines.push(`<div>${parts.join('')}</div>`);
+    }
+
+    // Origin → Destination (from adsbdb route enrichment)
+    if (f.has('route') && ac.route) {
+      const o = ac.route.origin || {};
+      const d = ac.route.destination || {};
+      const oCode = o.iata || o.icao;
+      const dCode = d.iata || d.icao;
+      if (oCode || dCode) {
+        lines.push(`<div class="lbl-route">${oCode || '?'}→${dCode || '?'}</div>`);
+      }
+    }
+
+    if (!lines.length) return '';
+    return `<div class="ac-label">${lines.join('')}</div>`;
+  }
+
+  function buildMarkerHtml(ac) {
     const heading = ac.heading_deg != null ? ac.heading_deg :
                     (ac.track_deg != null ? ac.track_deg : 0);
-    const html = `
-      ${aircraftIconSvg(heading)}
-      <div class="ac-label">
-        <div class="lbl-cs">${ac.callsign || ac.icao}</div>
-        <div><span class="lbl-alt">${fmtFL(ac.alt_baro_ft)}</span><span class="lbl-vrate">${fmtVrate(ac.vrate_fpm)}</span></div>
-        <div><span class="lbl-spd">${fmtSpeed(ac.gs_kt)}kt</span></div>
-      </div>`;
+    return aircraftIconSvg(heading) + aircraftLabelHtml(ac);
+  }
+
+  function markerClass(ac) {
+    return 'ac-marker fl-' + flBand(ac.alt_baro_ft) +
+           (ac.tcas_ra_active ? ' tcas-ra' : '') +
+           (ac.icao === state.selectedIcao ? ' selected' : '');
+  }
+
+  function makeMarker(ac) {
     const icon = L.divIcon({
-      html,
-      className: 'ac-marker fl-' + flBand(ac.alt_baro_ft) + (ac.tcas_ra_active ? ' tcas-ra' : ''),
+      html: buildMarkerHtml(ac),
+      className: markerClass(ac),
       iconSize: [0, 0],
       iconAnchor: [0, 0],
     });
@@ -152,20 +319,12 @@
     const existing = markers.get(ac.icao);
     if (existing) {
       existing.setLatLng([ac.lat, ac.lon]);
-      // Rebuild the icon to refresh heading/altitude/etc.
-      const heading = ac.heading_deg != null ? ac.heading_deg :
-                      (ac.track_deg != null ? ac.track_deg : 0);
-      const html = `
-        ${aircraftIconSvg(heading)}
-        <div class="ac-label">
-          <div class="lbl-cs">${ac.callsign || ac.icao}</div>
-          <div><span class="lbl-alt">${fmtFL(ac.alt_baro_ft)}</span><span class="lbl-vrate">${fmtVrate(ac.vrate_fpm)}</span></div>
-          <div><span class="lbl-spd">${fmtSpeed(ac.gs_kt)}kt</span></div>
-        </div>`;
-      const cls = 'ac-marker fl-' + flBand(ac.alt_baro_ft) +
-                  (ac.tcas_ra_active ? ' tcas-ra' : '') +
-                  (ac.icao === state.selectedIcao ? ' selected' : '');
-      existing.setIcon(L.divIcon({ html, className: cls, iconSize: [0,0], iconAnchor: [0,0] }));
+      existing.setIcon(L.divIcon({
+        html: buildMarkerHtml(ac),
+        className: markerClass(ac),
+        iconSize: [0, 0],
+        iconAnchor: [0, 0],
+      }));
     } else {
       const m = makeMarker(ac);
       markers.set(ac.icao, m);
@@ -242,9 +401,24 @@
                   (ac.tcas_ra_active ? 'tcas-ra' : '');
       const typ = ac.info?.type_code || '—';
       const bdsCount = (ac.bds_observed || []).length;
+      // Route (origin → destination) inlined under the callsign when
+      // route enrichment has resolved this callsign.
+      let routeStr = '';
+      if (ac.route) {
+        const o = ac.route.origin || {};
+        const d = ac.route.destination || {};
+        const oCode = o.iata || o.icao;
+        const dCode = d.iata || d.icao;
+        if (oCode || dCode) {
+          routeStr = `<span class="cs-route">${oCode || '?'}→${dCode || '?'}</span>`;
+        }
+      }
       return `<li class="${cls}" data-icao="${ac.icao}">
         <span class="icao">${ac.icao}</span>
-        <span class="cs">${ac.callsign || ''}</span>
+        <span class="cs">
+          <span class="cs-name">${ac.callsign || ''}</span>
+          ${routeStr}
+        </span>
         <span class="typ">${typ}</span>
         <span class="fl">${fmtFL(ac.alt_baro_ft)}</span>
         <span class="gs">${fmtSpeed(ac.gs_kt)}</span>
@@ -258,6 +432,32 @@
   }
 
   // ─── Detail pane ────────────────────────────────────────────────────
+
+  // Route enrichment block (adsbdb.com origin/destination).  Returns ''
+  // if the aircraft has no route data; both detail-pane modes render it
+  // identically inside the header.
+  function routeBlock(ac) {
+    const r = ac.route;
+    if (!r) return '';
+    const o = r.origin || {};
+    const d = r.destination || {};
+    if (!o.iata && !o.icao && !d.iata && !d.icao) return '';
+    const oCode = o.iata || o.icao || '???';
+    const dCode = d.iata || d.icao || '???';
+    const oName = o.municipality || o.name || '';
+    const dName = d.municipality || d.name || '';
+    const airline = r.airline ? `<div class="airline">${r.airline}</div>` : '';
+    return `
+      <div class="detail-route">
+        <span class="ap" title="${o.name || ''}">${oCode}</span>
+        ${oName ? `<span class="ap-name">${oName}</span>` : ''}
+        <span class="arrow">→</span>
+        <span class="ap" title="${d.name || ''}">${dCode}</span>
+        ${dName ? `<span class="ap-name">${dName}</span>` : ''}
+        <span class="src-pill">${(r.source || 'route').toUpperCase()}</span>
+        ${airline}
+      </div>`;
+  }
 
   function fmtMaybe(v, suffix = '', precision = 0) {
     if (v == null) return '—';
@@ -366,6 +566,7 @@
           ${op ? '<span style="color:var(--fg-bright)">' + op.name + '</span>' : '<span style="color:var(--fg-dim)">unknown operator</span>'}
           ${badges}
         </div>
+        ${routeBlock(ac)}
       </div>
 
       ${tcasBlock}
@@ -566,6 +767,7 @@
           ${op ? '<span style="color:var(--fg-bright)">' + op.name + '</span>' : '<span style="color:var(--fg-dim)">unknown operator</span>'}
           ${badges}
         </div>
+        ${routeBlock(ac)}
       </div>
 
       ${tcasBlock}
@@ -760,6 +962,7 @@
     for (const ac of msg.aircraft || []) state.aircraft.set(ac.icao, ac);
     if (msg.receiver) updateRxInfo(msg.receiver);
     if (msg.stats) updateStats(msg.stats);
+    if (msg.config) applyConfig(msg.config);
     if (msg.tcas_events) {
       // Replace; the snapshot is authoritative
       state.raEvents = msg.tcas_events.map(e => ({
@@ -855,6 +1058,9 @@
           break;
         case 'event':
           handleEvent(env);
+          break;
+        case 'config':
+          applyConfig(env.config);
           break;
         default:
           // Unknown/forward-compat

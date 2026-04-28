@@ -94,6 +94,13 @@ class Aircraft:
     db_info: object = None
     _db_info_callsign: str | None = None  # callsign at last lookup
 
+    # Route enrichment (origin/destination/airline) from the external
+    # adsbdb.com lookup.  Populated asynchronously by RouteResolver when
+    # route enrichment is enabled; otherwise None.  Keyed by callsign,
+    # so it persists across re-resolutions of the same callsign.
+    route: dict | None = None
+    _route_callsign: str | None = None  # callsign at last route fetch
+
     # Pending autopilot/intent changes awaiting confirmation.
     # BDS 4,0 inference can occasionally false-positive on a single message,
     # so we require a new value to appear in two consecutive observations
@@ -225,4 +232,5 @@ class Aircraft:
             "bds_observed": sorted(self.bds_observed),
             "trail": list(self.trail),
             "info": info_dict,
+            "route": self.route,
         }

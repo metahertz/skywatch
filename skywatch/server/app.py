@@ -82,6 +82,8 @@ class AppServer:
         self.engine.subscribe(self._on_engine_event)
         # Send a snapshot to each new WS client.
         self.ws.on_open = self._send_snapshot
+        # Accept client → server config messages (e.g. enrichment toggles).
+        self.ws.on_message = self._on_ws_message
 
     def _on_engine_event(self, event: dict) -> None:
         if event.get("type") == "update":
@@ -95,7 +97,33 @@ class AppServer:
 
     def _send_snapshot(self, client) -> None:
         snap = self.engine.snapshot()
+        snap["config"] = self._current_config()
         client.send_text(_to_json(snap))
+
+    def _current_config(self) -> dict:
+        rr = getattr(self.engine, "route_resolver", None)
+        return {
+            "route_enrichment": bool(rr.enabled) if rr is not None else False,
+            "route_enrichment_available": rr is not None,
+        }
+
+    def _on_ws_message(self, client, text: str) -> None:
+        try:
+            env = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(env, dict):
+            return
+        if env.get("type") == "set_route_enrichment":
+            rr = getattr(self.engine, "route_resolver", None)
+            if rr is None:
+                return
+            rr.set_enabled(bool(env.get("enabled")))
+            # Echo the new config to all clients so every UI updates.
+            self.ws.broadcast(_to_json({
+                "type": "config",
+                "config": self._current_config(),
+            }))
 
     # ------------------------------------------------------------------
     # Broadcaster: drains the pending queue at fixed rate
