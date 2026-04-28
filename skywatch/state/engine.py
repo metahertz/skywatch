@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict
@@ -21,6 +23,23 @@ from skywatch.decoder import adsb, common
 from skywatch.decoder import modes as ms
 from skywatch.decoder.beast import BeastFrame
 from skywatch.state.aircraft import Aircraft, TcasEvent
+
+# Diagnostic: when SKYWATCH_TRACE_ICAO is set (comma-separated tokens), log
+# every TC=29 and inferred BDS-4,0 frame matching those aircraft to stderr,
+# including the raw 28-byte hex and the bit values at message positions
+# 80-88 (where both message types carry their autopilot-mode flags, just
+# at different offsets per spec).  Use this to prove whether a flapping
+# autopilot-mode event is real wire data, transponder firmware
+# inconsistency, or a BDS-4,0 false-positive on a misidentified frame.
+#
+# Tokens may be either ICAO 24-bit addresses (e.g. 407FC7) OR callsigns
+# (e.g. RRR1230) — both are matched, case-insensitive, so you can paste
+# whatever the event ticker shows.
+_TRACE_TOKENS = {
+    s.strip().upper()
+    for s in os.environ.get("SKYWATCH_TRACE_ICAO", "").split(",")
+    if s.strip()
+}
 
 log = logging.getLogger("skywatch.engine")
 
@@ -335,6 +354,8 @@ class StateEngine:
         elif tc == 29:
             t = adsb.target_state(msg)
             if t:
+                # Snapshot intent state before applying changes
+                pre = self._snapshot_intent(ac)
                 if t.selected_alt_ft is not None:
                     if t.alt_source == "FMS":
                         ac.sel_alt_fms_ft = t.selected_alt_ft
@@ -351,6 +372,12 @@ class StateEngine:
                     "approach": t.approach,
                     "tcas": t.tcas_operational,
                 }
+                self._trace_modes(ac, msg, "TC29", {
+                    "autopilot": t.autopilot, "vnav": t.vnav,
+                    "alt_hold": t.alt_hold, "approach": t.approach,
+                    "tcas": t.tcas_operational,
+                })
+                self._emit_intent_changes(ac, pre, ts, source="TC29")
 
         elif tc == 31:
             os = adsb.operational_status(msg)
@@ -382,17 +409,24 @@ class StateEngine:
                 ac.callsign = d
                 self._refresh_info(ac)
         elif winner.bds_code == "4,0" and isinstance(d, ms.BDS40):
+            # BDS 4,0 carries selected altitudes + QNH; we deliberately do
+            # NOT consume its mode-flag bits because real-world transponder
+            # firmwares encode them inconsistently with TC=29.  TC=29 is the
+            # sole source of truth for autopilot modes.
+            pre = self._snapshot_intent(ac)
             if d.mcp_alt_ft is not None:
                 ac.sel_alt_mcp_ft = d.mcp_alt_ft
             if d.fms_alt_ft is not None:
                 ac.sel_alt_fms_ft = d.fms_alt_ft
             if d.qnh_mb is not None:
                 ac.qnh_mb = d.qnh_mb
-            ac.autopilot_modes = {
-                "vnav": d.vnav_mode,
-                "alt_hold": d.alt_hold_mode,
-                "approach": d.approach_mode,
-            }
+            self._trace_modes(ac, msg, "BDS40", {
+                "modes": "ignored (TC=29 is source of truth)",
+            }, extra={
+                "candidates": [(c.bds_code, c.confidence) for c in candidates],
+                "mcp": d.mcp_alt_ft, "fms": d.fms_alt_ft, "qnh": d.qnh_mb,
+            })
+            self._emit_intent_changes(ac, pre, time.time(), source="BDS40")
         elif winner.bds_code == "5,0" and isinstance(d, ms.BDS50):
             if d.roll_deg is not None:
                 ac.roll_deg = d.roll_deg
@@ -497,6 +531,229 @@ class StateEngine:
                 if not tac.tcas_ra_active:
                     tac.tcas_threat_icao = ac.icao
                     self._emit_update(tac)
+
+    # -----------------------------------------------------------------
+    # Autopilot intent change detection
+    # -----------------------------------------------------------------
+
+    # Threshold below which a selected-heading change is considered routine
+    # bug-following noise rather than a deliberate new heading select.
+    _HEADING_CHANGE_DEG = 5.0
+    # QNH is set on a 0.1 mb LSB, but real-world QNH only changes at
+    # transition altitude or when ATC issues a new setting; require >= 0.5 mb.
+    _QNH_CHANGE_MB = 0.5
+    # Per-source LSB floor for selected-altitude changes.  BDS 4,0 ("Mode S
+    # EHS — selected vertical intention") encodes MCP/FCU and FMS selected
+    # altitude with a 16 ft LSB.  ADS-B TC=29 ("Target state and status")
+    # commonly lands on a 32 ft grid.  Sub-LSB deltas are just rounding —
+    # often from cross-source quantization of the same physical selection —
+    # not a deliberate new altitude select, so we suppress the event.
+    _SEL_ALT_LSB_FT = {"BDS40": 16, "TC29": 32}
+
+    @staticmethod
+    def _trace_modes(ac: Aircraft, msg: str, source: str, decoded: dict,
+                     extra: dict | None = None) -> None:
+        """Diagnostic dump of an autopilot-mode frame, when the aircraft
+        matches SKYWATCH_TRACE_ICAO (ICAO hex or callsign).  Off by default."""
+        if not _TRACE_TOKENS:
+            return
+        cs = (ac.callsign or "").upper()
+        if ac.icao.upper() not in _TRACE_TOKENS and cs not in _TRACE_TOKENS:
+            return
+        # Bit positions 80-88 cover both decoders' mode-flag regions:
+        #   TC29:  80=mode_valid 81=AP 82=VNAV 83=ALT_HOLD 84=IMF
+        #          85=APPROACH 86=TCAS 87=LNAV 88=-
+        #   BDS40: 80=mode_status 81=VNAV 82=ALT_HOLD 83=APPROACH
+        #          84-85=reserved 86=src_status 87-88=tgt_alt_src
+        bits = "".join(str(common.get_bit(msg, b)) for b in range(80, 89))
+        extra_s = f" {extra}" if extra else ""
+        print(
+            f"[TRACE {source} {ac.icao}/{cs or '-'}] hex={msg} "
+            f"msg[80-88]={bits} modes={decoded}{extra_s}",
+            file=sys.stderr, flush=True,
+        )
+
+    @staticmethod
+    def _snapshot_intent(ac: Aircraft) -> dict:
+        """Capture the autopilot/intent state for later diffing."""
+        return {
+            "sel_alt_mcp_ft": ac.sel_alt_mcp_ft,
+            "sel_alt_fms_ft": ac.sel_alt_fms_ft,
+            "qnh_mb": ac.qnh_mb,
+            "selected_heading_deg": ac.selected_heading_deg,
+            "autopilot_modes": dict(ac.autopilot_modes or {}),
+        }
+
+    def _emit_intent_changes(
+        self, ac: Aircraft, pre: dict, ts: float, source: str,
+    ) -> None:
+        """Compare the aircraft's intent state to `pre` and emit events
+        for each change.  Applies a one-frame hysteresis to defend against
+        BDS 4,0 false-positive single frames.
+
+        `source` is "TC29" (ADS-B v2 broadcast) or "BDS40" (Comm-B reply).
+        """
+        post = self._snapshot_intent(ac)
+        cs = ac.callsign or ac.icao
+
+        # ---- Selected altitude changes (MCP and FMS tracked separately) ---
+        for field, label in (
+            ("sel_alt_mcp_ft", "MCP"),
+            ("sel_alt_fms_ft", "FMS"),
+        ):
+            old, new = pre[field], post[field]
+            if new is None or new == old:
+                continue
+            # First-ever observation: emit immediately, no hysteresis.
+            if old is None:
+                ac._sel_alt_source[label] = source
+                self._log_event({
+                    "t": ts,
+                    "type": "intent_change",
+                    "subtype": "selected_altitude",
+                    "icao": ac.icao,
+                    "callsign": cs,
+                    "field": label,
+                    "old": None,
+                    "new": new,
+                    "summary": f"SEL ALT ({label}) {new:,} ft",
+                    "source": source,
+                })
+                continue
+            # Sub-LSB floor.  BDS40 has a 16 ft LSB; TC29 lands on a 32 ft
+            # grid.  When a value crosses sources, the same physical
+            # selection can re-grid by up to the coarser of the two LSBs
+            # (e.g. TC29's 37024 ft → BDS40's 37000 ft = 24 ft "change"
+            # that is purely regridding).  Pick the coarser threshold.
+            old_src = ac._sel_alt_source.get(label, source)
+            min_step = max(
+                self._SEL_ALT_LSB_FT.get(source, 0),
+                self._SEL_ALT_LSB_FT.get(old_src, 0),
+            )
+            if min_step and abs(new - old) < min_step:
+                # Quiet update: refresh source (so the next compare uses
+                # the correct LSB) but don't emit and don't run hysteresis.
+                ac._sel_alt_source[label] = source
+                continue
+            # Subsequent change: hysteresis.  Require the new value to
+            # appear twice in a row before accepting it.  This defends
+            # against single-frame BDS 4,0 false positives.
+            pending_key = f"{field}"
+            if ac._pending_intent.get(pending_key) != new:
+                ac._pending_intent[pending_key] = new
+                # Roll back so the UI doesn't briefly display a noisy value
+                setattr(ac, field, old)
+                continue
+            ac._pending_intent.pop(pending_key, None)
+            ac._sel_alt_source[label] = source
+            old_str = f"{old:,} ft"
+            new_str = f"{new:,} ft"
+            self._log_event({
+                "t": ts,
+                "type": "intent_change",
+                "subtype": "selected_altitude",
+                "icao": ac.icao,
+                "callsign": cs,
+                "field": label,
+                "old": old,
+                "new": new,
+                "summary": f"SEL ALT ({label}) {old_str} → {new_str}",
+                "source": source,
+            })
+
+        # ---- QNH changes ----
+        old, new = pre["qnh_mb"], post["qnh_mb"]
+        if new is not None and old is not None:
+            if abs(new - old) >= self._QNH_CHANGE_MB:
+                pending_key = "qnh_mb"
+                # Confirm the new QNH twice before announcing
+                pending = ac._pending_intent.get(pending_key)
+                if pending is None or abs(pending - new) >= self._QNH_CHANGE_MB:
+                    ac._pending_intent[pending_key] = new
+                    ac.qnh_mb = old   # roll back until confirmed
+                else:
+                    ac._pending_intent.pop(pending_key, None)
+                    self._log_event({
+                        "t": ts,
+                        "type": "intent_change",
+                        "subtype": "qnh",
+                        "icao": ac.icao,
+                        "callsign": cs,
+                        "old": old,
+                        "new": new,
+                        "summary": f"QNH {old:.1f} → {new:.1f} mb",
+                        "source": source,
+                    })
+        elif new is not None and old is None:
+            # First-ever QNH report — emit as a single event
+            self._log_event({
+                "t": ts,
+                "type": "intent_change",
+                "subtype": "qnh",
+                "icao": ac.icao,
+                "callsign": cs,
+                "old": None,
+                "new": new,
+                "summary": f"QNH {new:.1f} mb",
+                "source": source,
+            })
+
+        # ---- Selected heading (only emit on substantial changes) ----
+        old, new = pre["selected_heading_deg"], post["selected_heading_deg"]
+        if new is not None:
+            if old is None:
+                self._log_event({
+                    "t": ts, "type": "intent_change", "subtype": "selected_heading",
+                    "icao": ac.icao, "callsign": cs,
+                    "old": None, "new": new,
+                    "summary": f"SEL HDG {new:03.0f}°",
+                    "source": source,
+                })
+            else:
+                # Smallest absolute angular distance
+                d = abs(((new - old + 540) % 360) - 180)
+                if d >= self._HEADING_CHANGE_DEG:
+                    self._log_event({
+                        "t": ts, "type": "intent_change",
+                        "subtype": "selected_heading",
+                        "icao": ac.icao, "callsign": cs,
+                        "old": old, "new": new,
+                        "summary": f"SEL HDG {old:03.0f}° → {new:03.0f}°",
+                        "source": source,
+                    })
+
+        # ---- Autopilot mode flag changes ----
+        # Each mode flip emits one event, but to defend against rapid
+        # source-alternation (TC29 vs BDS40 disagreement) we suppress
+        # repeats of the same flip within MODE_DWELL_S of the previous one.
+        old_modes = pre["autopilot_modes"] or {}
+        new_modes = post["autopilot_modes"] or {}
+        for mode in set(old_modes) | set(new_modes):
+            o = old_modes.get(mode)
+            n = new_modes.get(mode)
+            if o == n or n is None:
+                continue
+            # Only report flips where both old and new were definitive bools.
+            if o is None:
+                continue
+            # Anti-spam: suppress a repeated flip of the same mode within 3s.
+            dwell_key = f"_mode_emit_{mode}"
+            last_emit = ac._pending_intent.get(dwell_key, 0.0)
+            if ts - last_emit < 3.0:
+                continue
+            ac._pending_intent[dwell_key] = ts
+            verb = "ENGAGED" if n else "DISENGAGED"
+            self._log_event({
+                "t": ts,
+                "type": "intent_change",
+                "subtype": "ap_mode",
+                "icao": ac.icao,
+                "callsign": cs,
+                "mode": mode,
+                "active": bool(n),
+                "summary": f"{mode.upper().replace('_', ' ')} {verb}",
+                "source": source,
+            })
 
     # -----------------------------------------------------------------
     # Plausibility

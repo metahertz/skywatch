@@ -94,6 +94,20 @@ class Aircraft:
     db_info: object = None
     _db_info_callsign: str | None = None  # callsign at last lookup
 
+    # Pending autopilot/intent changes awaiting confirmation.
+    # BDS 4,0 inference can occasionally false-positive on a single message,
+    # so we require a new value to appear in two consecutive observations
+    # before emitting a "changed" event to the UI.  Maps field name to the
+    # candidate value last seen but not yet confirmed.
+    _pending_intent: dict = field(default_factory=dict)
+
+    # Source ("BDS40" / "TC29") of the value currently held in each
+    # selected-altitude field.  Used to suppress cross-source regridding
+    # noise (BDS 4,0 has a 16 ft LSB; TC=29 lands on a 32 ft grid, so the
+    # same physical selection can show as e.g. 37024 ft via TC29 then
+    # 37000 ft via BDS40 without anything actually changing).
+    _sel_alt_source: dict = field(default_factory=dict)
+
     # Position trail
     trail: deque = field(default_factory=lambda: deque(maxlen=120))
 

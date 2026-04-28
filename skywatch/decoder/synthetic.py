@@ -369,13 +369,33 @@ class Scenario:
     receiver_lon: float = -0.4614
     duration_s: float = 600.0
     tcas_event: tuple[str, str, float] | None = None  # (icao_a, icao_b, t_seconds)
+    # Scripted autopilot intent changes:
+    #   list of (icao, t_seconds, field, new_value) tuples
+    # Field is one of: "sel_alt_ft", "qnh_mb"
+    intent_changes: list[tuple[str, float, str, float]] = field(default_factory=list)
     _t: float = 0.0
+
+    def _apply_intent_changes(self) -> None:
+        """Mutate the aircraft state for any intent change due now."""
+        if not self.intent_changes:
+            return
+        for icao, t_event, field_name, new_val in self.intent_changes:
+            if abs(self._t - t_event) > 0.5:
+                continue
+            for ac in self.aircraft:
+                if ac.icao != icao:
+                    continue
+                old = getattr(ac, field_name, None)
+                if old != new_val:
+                    setattr(ac, field_name, new_val)
 
     def step(self, dt: float = 1.0):
         """Advance the simulated time by `dt`; yield (t, hex_msg) tuples."""
         self._t += dt
         for ac in self.aircraft:
             ac.step(dt)
+        # Apply any scripted autopilot/intent changes scheduled for this tick
+        self._apply_intent_changes()
 
         # Each aircraft squitters at varying rates
         for ac in self.aircraft:
@@ -467,4 +487,18 @@ def default_scenario() -> Scenario:
         ],
         # Schedule a TCAS event between BAW217 and the climbing EIN98K at t=45s
         tcas_event=("406B90", "4CA9B5", 45.0),
+        # A handful of scripted autopilot intent changes spread across the
+        # simulation, so the event ticker has something to show:
+        intent_changes=[
+            # ATC steps DAL58 down for the approach (t=20s)
+            ("A1B2C3", 20.0, "sel_alt_ft", 3000),
+            # KLM43H is cleared further down at t=30
+            ("4844F1", 30.0, "sel_alt_ft", 12000),
+            # Transition altitude crossed: QNH of 1011.5 set on DAL58 at t=40
+            ("A1B2C3", 40.0, "qnh_mb",     1011.5),
+            # Post-RA, ATC clears EIN98K to FL370 at t=70
+            ("4CA9B5", 70.0, "sel_alt_ft", 37000),
+            # KLM43H stepped down again to 8000 at t=80 (continuing approach)
+            ("4844F1", 80.0, "sel_alt_ft", 8000),
+        ],
     )

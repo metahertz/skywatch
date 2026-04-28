@@ -17,6 +17,7 @@
     stats: {},
     frameTimes: [],          // sliding window for rate calc
     filterText: '',
+    detailMode: localStorage.getItem('skywatch.detailMode') || 'compact',
   };
 
   // ─── DOM ────────────────────────────────────────────────────────────
@@ -24,6 +25,7 @@
   const el = {
     list: document.getElementById('aircraft-list'),
     detail: document.getElementById('detail-pane'),
+    detailContent: document.getElementById('detail-content'),
     eventLog: document.getElementById('event-log'),
     raTimeline: document.getElementById('ra-timeline'),
     raCount: document.getElementById('ra-count'),
@@ -40,6 +42,20 @@
   el.filter.addEventListener('input', () => {
     state.filterText = el.filter.value.trim().toUpperCase();
     renderList();
+  });
+
+  // Detail-pane view toggle: compact vs verbose+source-provenance.
+  // Choice persisted in localStorage so reloads remember it.
+  document.querySelectorAll('.detail-mode-btn').forEach(btn => {
+    if (btn.dataset.mode === state.detailMode) btn.classList.add('active');
+    btn.addEventListener('click', () => {
+      if (btn.dataset.mode === state.detailMode) return;
+      state.detailMode = btn.dataset.mode;
+      localStorage.setItem('skywatch.detailMode', state.detailMode);
+      document.querySelectorAll('.detail-mode-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.mode === state.detailMode));
+      renderDetail();
+    });
   });
 
   // ─── Map ────────────────────────────────────────────────────────────
@@ -254,9 +270,17 @@
   function renderDetail() {
     const ac = state.aircraft.get(state.selectedIcao);
     if (!ac) {
-      el.detail.innerHTML = '<div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>';
+      el.detailContent.innerHTML = '<div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>';
       return;
     }
+    if (state.detailMode === 'compact') {
+      renderDetailCompact(ac);
+    } else {
+      renderDetailVerbose(ac);
+    }
+  }
+
+  function renderDetailVerbose(ac) {
     const info = ac.info || {};
     const op = info.operator;
     const t = info.type;
@@ -326,7 +350,7 @@
         </div>
       </div>` : '';
 
-    el.detail.innerHTML = `
+    el.detailContent.innerHTML = `
       <div class="detail-header">
         <div class="icao-line">
           <span class="icao">${ac.icao}</span>
@@ -430,6 +454,147 @@
     `;
   }
 
+  // Compact detail renderer.  Same data as the verbose pane, but with
+  // a denser two-column key/value grid per section and no per-field
+  // source-provenance pills (those live in the VERBOSE view).
+  function renderDetailCompact(ac) {
+    const info = ac.info || {};
+    const op = info.operator;
+    const t = info.type;
+
+    let badges = '';
+    if (info.is_military) badges += '<span class="badge badge-mil">MIL</span>';
+    if (info.is_pia) badges += '<span class="badge badge-pia">PIA</span>';
+    if (info.is_interesting) badges += '<span class="badge badge-int">SPECIAL</span>';
+
+    function row(k, v) {
+      return `<div class="detail-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+    }
+    function rowAlert(k, v, alertOn) {
+      return `<div class="detail-row${alertOn ? ' alert' : ''}"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+    }
+
+    const tcasBlock = ac.tcas_ra_active ? `
+      <div class="detail-section">
+        <h4>TCAS RESOLUTION ADVISORY</h4>
+        <div class="tcas-summary">
+          <div class="ra-cmd">${ac.tcas_ra_summary || ''}</div>
+          ${ac.tcas_threat_icao ? `<div style="font-size:10px;color:var(--amber);margin-top:4px;">Threat: ${ac.tcas_threat_icao}</div>` : ''}
+        </div>
+      </div>` : '';
+
+    // Combine vrate arrow into altitude line
+    const altLine = ac.alt_baro_ft != null
+      ? `${fmtFL(ac.alt_baro_ft)}${fmtVrate(ac.vrate_fpm)}`
+      : '—';
+
+    const positionRows = [
+      row('LAT',    ac.lat != null ? ac.lat.toFixed(4) : '—'),
+      row('LON',    ac.lon != null ? ac.lon.toFixed(4) : '—'),
+      row('ALT',    altLine),
+      row('GNSS',   fmtMaybe(ac.alt_gnss_ft, ' ft')),
+      row('GROUND', ac.on_ground ? 'YES' : 'NO'),
+      rowAlert('FS', ac.flight_status || '—', !!ac.alert),
+    ];
+    if (ac.squawk) {
+      positionRows.push(rowAlert('SQK', ac.squawk, ['7500','7600','7700'].includes(ac.squawk)));
+    }
+    if (ac.spi) positionRows.push(rowAlert('SPI', 'ACTIVE', true));
+
+    const velocityRows = [
+      row('GS',       fmtMaybe(ac.gs_kt, ' kt')),
+      row('TAS',      fmtMaybe(ac.tas_kt, ' kt')),
+      row('IAS',      fmtMaybe(ac.ias_kt, ' kt')),
+      row('MACH',     ac.mach != null ? ac.mach.toFixed(3) : '—'),
+      row('TRACK',    fmtHeading(ac.track_deg)),
+      row('HDG',      fmtHeading(ac.heading_deg)),
+      row('VRATE',    fmtMaybe(ac.vrate_fpm, ' fpm')),
+      row('ROLL',     ac.roll_deg != null ? ac.roll_deg.toFixed(1) + '°' : '—'),
+    ];
+
+    const hasAutopilot = ac.sel_alt_mcp_ft || ac.sel_alt_fms_ft || ac.qnh_mb || ac.selected_heading_deg != null;
+    const apModes = ac.autopilot_modes
+      ? Object.entries(ac.autopilot_modes).filter(([,v]) => v).map(([k]) => k.toUpperCase())
+      : [];
+    const apBlock = hasAutopilot ? `
+      <div class="detail-section">
+        <h4>AUTOPILOT INTENT</h4>
+        <div class="detail-grid cols-2">
+          ${row('SEL ALT (MCP)', fmtMaybe(ac.sel_alt_mcp_ft, ' ft'))}
+          ${row('SEL ALT (FMS)', fmtMaybe(ac.sel_alt_fms_ft, ' ft'))}
+          ${row('SEL HDG', fmtHeading(ac.selected_heading_deg))}
+          ${row('QNH', ac.qnh_mb != null ? ac.qnh_mb.toFixed(1) + ' mb' : '—')}
+        </div>
+        ${apModes.length ? `<div class="modes-line"><span class="modes-lbl">Modes:</span> ${apModes.join(' / ')}</div>` : ''}
+      </div>` : '';
+
+    const hasMet = ac.wind_speed_kt || ac.static_air_temp_c;
+    const metBlock = hasMet ? `
+      <div class="detail-section">
+        <h4>METEOROLOGY</h4>
+        <div class="detail-grid cols-2">
+          ${row('WIND', `${fmtHeading(ac.wind_direction_deg)} / ${fmtMaybe(ac.wind_speed_kt, 'kt')}`)}
+          ${row('SAT', ac.static_air_temp_c != null ? ac.static_air_temp_c.toFixed(1) + '°C' : '—')}
+        </div>
+      </div>` : '';
+
+    const linkRows = [
+      row('RSSI',   ac.rssi != null ? ac.rssi.toFixed(1) + ' dBFS' : '—'),
+      row('ADS-B',  ac.adsb_version != null ? 'v' + ac.adsb_version : '—'),
+      row('NIC',    fmtMaybe(ac.nic)),
+      row('NACp',   fmtMaybe(ac.nac_p)),
+      row('SIL',    fmtMaybe(ac.sil)),
+      row('CAT',    ac.category || '—'),
+    ];
+
+    const bdsCount = (ac.bds_observed || []).length;
+    const dfCount = Object.values(ac.msg_counts || {}).reduce((a,b) => a + b, 0);
+
+    el.detailContent.innerHTML = `
+      <div class="detail-header">
+        <div class="icao-line">
+          <span class="icao">${ac.icao}</span>
+          <span class="cs">${ac.callsign || '—'}</span>
+        </div>
+        <div class="reg">
+          ${info.registration || '—'}
+          <span class="reg-src">${info.registration_source ? '[' + info.registration_source.toUpperCase() + ']' : ''}</span>
+        </div>
+        <div class="descr">${info.description || (t ? t.manufacturer + ' ' + t.model : '')}</div>
+        <div class="meta">
+          <span class="country-flag">${info.country_code || '??'}</span>
+          ${op ? '<span style="color:var(--fg-bright)">' + op.name + '</span>' : '<span style="color:var(--fg-dim)">unknown operator</span>'}
+          ${badges}
+        </div>
+      </div>
+
+      ${tcasBlock}
+
+      <div class="detail-section">
+        <h4>POSITION &amp; ALTITUDE</h4>
+        <div class="detail-grid cols-2">${positionRows.join('')}</div>
+      </div>
+
+      <div class="detail-section">
+        <h4>VELOCITY</h4>
+        <div class="detail-grid cols-2">${velocityRows.join('')}</div>
+      </div>
+
+      ${apBlock}
+      ${metBlock}
+
+      <div class="detail-section">
+        <h4>LINK QUALITY</h4>
+        <div class="detail-grid cols-2">${linkRows.join('')}</div>
+      </div>
+
+      <div class="detail-section detail-footer">
+        <span class="detail-footer-item">BDS <span class="n">${bdsCount}</span></span>
+        <span class="detail-footer-item">FRAMES <span class="n">${dfCount}</span></span>
+      </div>
+    `;
+  }
+
   function selectAircraft(icao) {
     state.selectedIcao = icao;
     renderList();
@@ -485,6 +650,11 @@
     } else if (ev.type === 'emergency') {
       cls = 'ev-emerg';
       msg = `EMERGENCY ${ev.icao}: ${ev.state}`;
+    } else if (ev.type === 'intent_change') {
+      cls = 'ev-intent ev-intent-' + (ev.subtype || 'misc');
+      const who = ev.callsign || ev.icao;
+      const src = ev.source ? ` <span class="ev-src">[${ev.source}]</span>` : '';
+      msg = `${who} · ${ev.summary || ''}${src}`;
     } else {
       msg = JSON.stringify(ev);
     }

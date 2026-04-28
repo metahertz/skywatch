@@ -105,13 +105,18 @@ def flight_status(msg: str) -> dict | None:
 
 @dataclass
 class BDS40:
-    """Selected vertical intention."""
+    """Selected vertical intention.
+
+    Note: the spec also defines VNAV / ALT_HOLD / APPROACH mode flags at
+    MB bits 49-51, but in practice many transponder firmwares encode
+    those bits inconsistently with TC=29 (ADS-B v2's "target state and
+    status").  ADS-B v2 introduced TC=29 specifically to replace the
+    BDS 4,0 mode flags, so we ignore them here and treat TC=29 as the
+    sole source of truth for autopilot mode state.
+    """
     mcp_alt_ft: int | None
     fms_alt_ft: int | None
     qnh_mb: float | None
-    vnav_mode: bool | None
-    alt_hold_mode: bool | None
-    approach_mode: bool | None
     target_alt_source: int | None  # 0/1/2/3 per spec
 
 
@@ -179,24 +184,41 @@ def decode_bds_40(msg: str) -> BDS40 | None:
     """BDS 4,0 — Selected vertical intention."""
     # Status bits at MB:1, MB:14, MB:27, and MB:48. msg bit = MB bit + 32.
     s_mcp = get_bit(msg, 33)
-    mcp = get_bits(msg, 34, 12) * 16 if s_mcp else None
+    mcp_raw = get_bits(msg, 34, 12) * 16 if s_mcp else None
     s_fms = get_bit(msg, 46)
-    fms = get_bits(msg, 47, 12) * 16 if s_fms else None
+    fms_raw = get_bits(msg, 47, 12) * 16 if s_fms else None
     s_baro = get_bit(msg, 59)
     qnh = (get_bits(msg, 60, 12) * 0.1) + 800 if s_baro else None
-    s_mode = get_bit(msg, 80)
-    if s_mode:
-        vnav = bool(get_bit(msg, 81))
-        alt_hold = bool(get_bit(msg, 82))
-        approach = bool(get_bit(msg, 83))
-    else:
-        vnav = alt_hold = approach = None
+    # Mode flag region (msg bits 80-83) is parsed only for the reserved-bits
+    # validator below; the values themselves are intentionally not exposed.
+    # See class docstring for why.
     s_src = get_bit(msg, 86)
     src = get_bits(msg, 87, 2) if s_src else None
 
+    # Real-world MCP/FMS altitudes are always set in 100 ft increments on
+    # the FCU, but the BDS 4,0 wire format uses a 16 ft LSB.  So a real
+    # selected altitude of 3000 ft transmits as floor(3000/16)*16 = 2992 ft.
+    # Snap each value to the nearest 100 ft, rejecting only values that
+    # are too far from any 100-ft boundary (which would indicate noise,
+    # not quantisation).
+    def _snap_to_hundred(raw: int | None) -> int | None:
+        if raw is None:
+            return None
+        rounded = round(raw / 100) * 100
+        # 16-ft LSB => max quantisation error is ±8 ft from the rounded
+        # value.  Allow 12 ft to be safe; reject anything further as noise.
+        if abs(raw - rounded) > 12:
+            return -1   # sentinel: invalid
+        return rounded
+
+    mcp = _snap_to_hundred(mcp_raw)
+    fms = _snap_to_hundred(fms_raw)
+    if mcp == -1 or fms == -1:
+        return None  # not a real selected altitude
+
     # Sanity: at least one real field; tighter ranges to avoid BDS-5,0/6,0
-    # false positives (which produce wildly large numbers).  Real ATC selected
-    # altitudes are 0-50000 ft and QNH 950-1050 mb in 99% of operations.
+    # false positives.  Real ATC selected altitudes are 0-50000 ft and
+    # QNH 950-1050 mb in 99% of operations.
     if mcp is None and fms is None and qnh is None:
         return None
     if mcp is not None and not (0 <= mcp <= 50000):
@@ -205,13 +227,18 @@ def decode_bds_40(msg: str) -> BDS40 | None:
         return None
     if qnh is not None and not (950 <= qnh <= 1050):
         return None
-    # MCP/FMS altitudes are always set in 100 ft increments on the FCU.
-    # The 16-ft LSB of the field means random bits give non-round values.
-    if mcp is not None and mcp % 100 != 0:
+
+    # Reserved bits between QNH (MB:39 ends at msg 71) and mode-status
+    # (MB:48 at msg 80) should all be zero per ICAO Annex 10 Vol IV.
+    # Genuine BDS 4,0 messages put zeros here; BDS 5,0 / 6,0 messages
+    # carry data in this range, so checking it is a sharp false-positive
+    # filter.  Same for the 2 reserved bits before s_src (msg 84-85).
+    reserved_72_79 = get_bits(msg, 72, 8)
+    reserved_84_85 = get_bits(msg, 84, 2)
+    if reserved_72_79 != 0 or reserved_84_85 != 0:
         return None
-    if fms is not None and fms % 100 != 0:
-        return None
-    return BDS40(mcp, fms, qnh, vnav, alt_hold, approach, src)
+
+    return BDS40(mcp, fms, qnh, src)
 
 
 def decode_bds_50(msg: str) -> BDS50 | None:

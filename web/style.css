@@ -437,9 +437,53 @@ body::before {
 /* ─── DETAIL PANE ────────────────────────────────────────────────── */
 
 .detail-pane {
+  overflow: hidden;
+}
+
+#detail-content {
+  flex: 1;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+
+/* View-mode toggle: pinned at top of the detail pane.  Lets the user
+ * switch between the COMPACT pane (denser, no source pills) and the
+ * VERBOSE pane (per-field ADS-B / Mode S source provenance). */
+.detail-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-bottom: var(--hairline);
+  background: var(--bg-cell);
+  flex-shrink: 0;
+}
+
+.detail-toggle-lbl {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  margin-right: 6px;
+}
+
+.detail-mode-btn {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid rgba(120, 200, 200, 0.15);
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  cursor: pointer;
+}
+
+.detail-mode-btn:hover { color: var(--fg-bright); border-color: rgba(120, 200, 200, 0.4); }
+
+.detail-mode-btn.active {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: rgba(245, 184, 61, 0.08);
 }
 
 .detail-empty {
@@ -539,6 +583,24 @@ body::before {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Two-column rows: used by the COMPACT view to halve vertical space.
+ * Each .detail-row inside this grid renders as one cell of the 2-col
+ * track, internally still showing key-on-left / value-on-right. */
+.detail-grid.cols-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 14px;
+  row-gap: 4px;
+}
+.detail-grid.cols-2 .detail-row {
+  grid-template-columns: minmax(0, auto) 1fr;
+  font-size: 10.5px;
+}
+.detail-grid.cols-2 .detail-row .k {
+  font-size: 9px;
+  letter-spacing: 0.1em;
 }
 
 .detail-row {
@@ -661,6 +723,22 @@ body::before {
   font-weight: 500;
 }
 
+/* Compact-view footer: tiny one-liner replacing the BDS-pills /
+ * DF-counts sections that the VERBOSE view shows in full. */
+.detail-footer {
+  display: flex;
+  gap: 14px;
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: var(--fg-dim);
+  border-bottom: none;
+}
+.detail-footer-item .n {
+  color: var(--fg-bright);
+  font-weight: 500;
+  margin-left: 4px;
+}
+
 .tcas-summary {
   background: rgba(255, 72, 72, 0.1);
   border: 1px solid var(--red);
@@ -713,6 +791,17 @@ body::before {
 #event-log .ev-msg { color: var(--fg-primary); }
 #event-log li.ev-tcas .ev-msg { color: var(--red-bright); }
 #event-log li.ev-emerg .ev-msg { color: var(--amber-bright); }
+
+/* Autopilot intent events.  Cyan tint to distinguish from TCAS (red),
+ * emergency (amber), and routine (green). Sub-classes can be styled
+ * further if specific events need to stand out. */
+#event-log li.ev-intent .ev-msg { color: var(--cyan); }
+#event-log li.ev-intent-ap_mode .ev-msg { color: var(--fg-bright); }
+#event-log li.ev-intent .ev-src {
+  color: var(--fg-faint);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
 
 /* ─── RA TIMELINE ────────────────────────────────────────────────── */
 

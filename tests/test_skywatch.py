@@ -296,6 +296,110 @@ class TestLookupCascade(unittest.TestCase):
 # End-to-end engine integration with synthetic feed
 # ─────────────────────────────────────────────────────────────────────
 
+class TestIntentChangeEvents(unittest.TestCase):
+    """Autopilot-intent change events should fire on selected-alt / QNH /
+    mode flips, with hysteresis to defend against single noisy frames."""
+
+    def _setup_engine(self):
+        from skywatch.state import StateEngine
+        if not SEED_PATH.exists():
+            from skywatch.db.seed import generate
+            generate()
+        db = MictronicsDB(SEED_PATH)
+        db.load()
+        lookup = InfoLookup(mictronics_db=db)
+        return StateEngine(receiver_lat=51.4775, receiver_lon=-0.4614,
+                           info_lookup=lookup), BeastParser()
+
+    def test_first_sel_alt_emits_immediately(self):
+        from skywatch.decoder.synthetic import (
+            make_bds40, make_df11_squitter,
+        )
+        from skywatch.decoder.beast import encode_beast
+        engine, parser = self._setup_engine()
+        # Establish the ICAO in the squitter roster first
+        for f in parser.feed(encode_beast(make_df11_squitter("ABC123"), 0.0)):
+            engine.feed(f)
+        # First BDS 4,0 — should produce an immediate event
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 24000, 24000, 1013.2, alt_ft=20000), 1.0)):
+            engine.feed(f)
+        intent_evs = [e for e in engine.events if e.get("type") == "intent_change"]
+        self.assertGreater(len(intent_evs), 0, "first SEL ALT should emit immediately")
+        # Should mention 24,000 ft
+        self.assertTrue(any("24,000" in e.get("summary", "") for e in intent_evs))
+
+    def test_changed_sel_alt_with_hysteresis(self):
+        """A change in selected altitude requires two confirming frames
+        before the event is emitted."""
+        from skywatch.decoder.synthetic import (
+            make_bds40, make_df11_squitter,
+        )
+        from skywatch.decoder.beast import encode_beast
+        engine, parser = self._setup_engine()
+        # Roster
+        for f in parser.feed(encode_beast(make_df11_squitter("ABC123"), 0.0)):
+            engine.feed(f)
+        # Establish initial value (immediate emit)
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 24000, 24000, 1013.2, alt_ft=20000), 1.0)):
+            engine.feed(f)
+        # Clear events from setup
+        baseline = len([e for e in engine.events if e.get("type") == "intent_change"])
+        # First frame with NEW value — should NOT emit yet
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 18000, 18000, 1013.2, alt_ft=20000), 2.0)):
+            engine.feed(f)
+        new_count = len([e for e in engine.events
+                         if e.get("type") == "intent_change"])
+        self.assertEqual(new_count, baseline,
+            "single change frame should NOT emit (hysteresis)")
+        # Second frame with same NEW value — should emit
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 18000, 18000, 1013.2, alt_ft=20000), 3.0)):
+            engine.feed(f)
+        confirmed = len([e for e in engine.events
+                         if e.get("type") == "intent_change"])
+        self.assertGreater(confirmed, baseline,
+            "second confirming frame should emit the change event")
+        # The new event should mention the change
+        latest = [e for e in engine.events
+                  if e.get("type") == "intent_change"][-1]
+        self.assertIn("18,000", latest.get("summary", ""))
+
+    def test_scenario_intent_changes(self):
+        """The default scenario should produce all scripted intent events."""
+        from skywatch.decoder.synthetic import default_scenario
+        from skywatch.decoder.beast import encode_beast
+        engine, parser = self._setup_engine()
+        scn = default_scenario()
+        for tick in range(95):
+            for t, msg in scn.step(1.0):
+                for f in parser.feed(encode_beast(msg, ts_seconds=t)):
+                    engine.feed(f)
+        # Count intent_change events by subtype
+        intent = [e for e in engine.events if e.get("type") == "intent_change"]
+        sel_alt_changes = [e for e in intent
+                           if e.get("subtype") == "selected_altitude"
+                           and e.get("old") is not None]
+        qnh_changes = [e for e in intent
+                       if e.get("subtype") == "qnh"
+                       and e.get("old") is not None]
+        # Scenario schedules 4 selected-altitude transitions with hysteresis
+        # (DAL58 to 3000, KLM43H to 12000, EIN98K to 37000, KLM43H to 8000)
+        # Each gives both MCP and FMS events because synthetic generator
+        # sets both fields equal — so 8 transitions in total.
+        self.assertGreaterEqual(len(sel_alt_changes), 6,
+            f"expected ≥6 selected-alt transitions, got {len(sel_alt_changes)}")
+        # Scenario schedules 1 QNH transition (DAL58 1013.2 → 1011.5)
+        self.assertGreaterEqual(len(qnh_changes), 1,
+            f"expected ≥1 QNH transition, got {len(qnh_changes)}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Full pipeline integration
+# ─────────────────────────────────────────────────────────────────────
+
 class TestIntegration(unittest.TestCase):
     """Run the full pipeline against the synthetic scenario."""
 

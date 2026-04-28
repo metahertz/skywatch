@@ -58,7 +58,14 @@
       </aside>
 
       <aside class="detail-pane" id="detail-pane">
-        <div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>
+        <div class="detail-toggle">
+          <span class="detail-toggle-lbl">VIEW</span>
+          <button class="detail-mode-btn" data-mode="compact">COMPACT</button>
+          <button class="detail-mode-btn" data-mode="verbose">VERBOSE · SRC</button>
+        </div>
+        <div id="detail-content">
+          <div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>
+        </div>
       </aside>
 
       <section class="events-pane">
