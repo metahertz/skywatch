@@ -24,6 +24,7 @@
         <div class="stat"><span class="lbl">RATE</span><span class="val" id="stat-rate">0/s</span></div>
         <div class="stat"><span class="lbl">DROP</span><span class="val" id="stat-drop">0</span></div>
         <div class="stat"><span class="lbl">A/C</span><span class="val" id="stat-aircraft">0</span></div>
+        <div class="stat" id="stat-rx" hidden><span class="lbl">RX</span><span class="val">0/0</span></div>
         <div class="stat" id="conn-stat"><span class="lbl">LINK</span><span class="val">DISCONN</span></div>
         <button class="toggle-btn" id="route-toggle" hidden
                 title="Look up origin/destination airports via adsbdb.com. Each lookup transmits the callsign to the third-party API.">
@@ -66,6 +67,7 @@
               <label><input type="checkbox" data-field="hdg"> TRACK</label>
               <label><input type="checkbox" data-field="squawk"> SQK</label>
               <label><input type="checkbox" data-field="route"> ROUTE</label>
+              <label><input type="checkbox" data-field="rx"> RX</label>
             </div>
           </details>
         </div>

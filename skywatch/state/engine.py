@@ -21,8 +21,9 @@ from typing import Callable
 
 from skywatch.decoder import adsb, common
 from skywatch.decoder import modes as ms
-from skywatch.decoder.beast import BeastFrame
+from skywatch.decoder.beast import BeastFrame, DEFAULT_RECEIVER_ID
 from skywatch.state.aircraft import Aircraft, TcasEvent
+from skywatch.state.receiver import Receiver, ReceiverRegistry
 
 # Diagnostic: when SKYWATCH_TRACE_ICAO is set (comma-separated tokens), log
 # every TC=29 and inferred BDS-4,0 frame matching those aircraft to stderr,
@@ -75,17 +76,34 @@ class StateEngine:
         max_range_nm: float = DEFAULT_MAX_RANGE_NM,
         info_lookup=None,
         route_resolver=None,
+        store=None,
     ) -> None:
         self.aircraft: dict[str, Aircraft] = {}
         # Optional callsign → route enrichment (adsbdb.com).  See
         # skywatch.enrich.route.RouteResolver.  None means disabled.
         self.route_resolver = route_resolver
+        # Optional MongoStore for persistence; None disables it.
+        self.store = store
         # ICAOs we've seen via squitter (DF11/17/18) recently. Used to
         # validate address-parity recoveries from short replies.
         self._squitter_roster: dict[str, float] = {}
-        self.receiver_lat = receiver_lat
-        self.receiver_lon = receiver_lon
-        self.max_range_nm = max_range_nm
+
+        # Receiver registry.  When the engine is constructed with a
+        # single (lat, lon, range) — the historical "one receiver"
+        # mode — we seed an entry under DEFAULT_RECEIVER_ID so the
+        # rest of the engine can treat single-receiver and
+        # multi-receiver flows uniformly.  AppServer adds further
+        # entries per --beast supplied on the CLI.
+        self.receivers = ReceiverRegistry()
+        if receiver_lat is not None or receiver_lon is not None:
+            self.receivers.upsert(
+                DEFAULT_RECEIVER_ID,
+                name="default",
+                lat=receiver_lat,
+                lon=receiver_lon,
+                max_range_nm=max_range_nm,
+            )
+        self._default_max_range_nm = max_range_nm
         # Optional InfoLookup for static aircraft metadata (registration,
         # type, country, operator).  See skywatch.db.lookup.
         self.info_lookup = info_lookup
@@ -110,6 +128,56 @@ class StateEngine:
         self._pending_cpr: dict[str, dict] = {}
 
     # -----------------------------------------------------------------
+    # Legacy single-receiver properties.
+    #
+    # Several callers and tests still reach for `engine.receiver_lat`,
+    # `engine.receiver_lon`, and `engine.max_range_nm` as if there were
+    # only one receiver.  Proxy these through the registry's primary
+    # entry (the first registered, used for the legacy single range
+    # ring etc.) so the historical API keeps working untouched.
+    # -----------------------------------------------------------------
+
+    @property
+    def receiver_lat(self) -> float | None:
+        rx = self.receivers.primary()
+        return rx.lat if rx else None
+
+    @receiver_lat.setter
+    def receiver_lat(self, v: float | None) -> None:
+        rx = self.receivers.primary()
+        if rx is None:
+            self.receivers.upsert(DEFAULT_RECEIVER_ID, name="default",
+                                  lat=v, max_range_nm=self._default_max_range_nm)
+        else:
+            rx.lat = v
+
+    @property
+    def receiver_lon(self) -> float | None:
+        rx = self.receivers.primary()
+        return rx.lon if rx else None
+
+    @receiver_lon.setter
+    def receiver_lon(self, v: float | None) -> None:
+        rx = self.receivers.primary()
+        if rx is None:
+            self.receivers.upsert(DEFAULT_RECEIVER_ID, name="default",
+                                  lon=v, max_range_nm=self._default_max_range_nm)
+        else:
+            rx.lon = v
+
+    @property
+    def max_range_nm(self) -> float:
+        rx = self.receivers.primary()
+        return rx.max_range_nm if rx else self._default_max_range_nm
+
+    @max_range_nm.setter
+    def max_range_nm(self, v: float) -> None:
+        rx = self.receivers.primary()
+        self._default_max_range_nm = v
+        if rx is not None:
+            rx.max_range_nm = v
+
+    # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
 
@@ -121,11 +189,37 @@ class StateEngine:
         self.total_frames += 1
         df_val = common.df(frame.raw_hex)
         self.frames_by_df[df_val] += 1
+        # Update per-receiver counters.  Auto-create a registry entry
+        # for any receiver_id we haven't seen before — the engine should
+        # never reject frames just because nobody pre-registered the
+        # source.  Lat/lon stay None until a CLI or persisted entry
+        # supplies them.
+        rx = self.receivers.get_or_create(frame.receiver_id)
+        rx.frames_total += 1
+        rx.last_frame_at = time.time()
+        rx.connected = True
+        # Hot-path persistence: archive every frame.  The store's
+        # enqueue is non-blocking; on overflow it drops to a counter
+        # so the engine never stalls waiting for the DB.
+        if self.store is not None:
+            # icao is recovered later inside _dispatch; we don't have it
+            # cheaply yet, so attach it best-effort by trying common
+            # quick paths.  Replay tooling can also recover ICAO from
+            # raw_hex on read.
+            try:
+                if df_val in (11, 17, 18):
+                    icao = common.icao_from_squitter(frame.raw_hex)
+                else:
+                    icao = None
+            except Exception:
+                icao = None
+            self.store.enqueue_frame(frame, icao)
         try:
             self._dispatch(frame, df_val)
-        except Exception as e:
+        except Exception:
             log.exception("Failed to handle frame %s", frame.raw_hex)
             self.frames_dropped += 1
+            rx.frames_dropped += 1
 
     def prune_stale(self, now: float | None = None) -> int:
         now = now or time.time()
@@ -133,6 +227,8 @@ class StateEngine:
         gone = [k for k, ac in self.aircraft.items() if ac.last_seen < cutoff]
         for k in gone:
             del self.aircraft[k]
+            if self.store is not None:
+                self.store.delete_aircraft(k)
         # Same for the roster
         self._squitter_roster = {
             k: t for k, t in self._squitter_roster.items() if t > now - 60
@@ -141,6 +237,7 @@ class StateEngine:
 
     def snapshot(self) -> dict:
         """Full state snapshot for new WebSocket clients."""
+        primary = self.receivers.primary()
         return {
             "type": "snapshot",
             "aircraft": [a.to_dict() for a in self.aircraft.values()],
@@ -154,11 +251,16 @@ class StateEngine:
             },
             "tcas_events": [self._serialise_tcas(e) for e in self.tcas_event_log],
             "events": list(self.events),
+            # `receiver` (singular) stays for clients that still expect a
+            # single range ring — filled with the primary receiver.
             "receiver": {
-                "lat": self.receiver_lat,
-                "lon": self.receiver_lon,
-                "max_range_nm": self.max_range_nm,
+                "lat": primary.lat if primary else None,
+                "lon": primary.lon if primary else None,
+                "max_range_nm": primary.max_range_nm if primary else self._default_max_range_nm,
             },
+            # `receivers` (plural) carries the full registry for the
+            # multi-receiver UI.
+            "receivers": self.receivers.to_list(),
         }
 
     # -----------------------------------------------------------------
@@ -176,8 +278,8 @@ class StateEngine:
             icao = common.icao_from_squitter(msg)
             self._squitter_roster[icao] = ts
             ac = self._get_or_create_aircraft(icao, ts)
-            ac.update_seen(ts, df_val, frame.rssi_dbfs)
-            self._handle_adsb(ac, msg, ts)
+            ac.update_seen(ts, df_val, frame.rssi_dbfs, receiver_id=frame.receiver_id)
+            self._handle_adsb(ac, msg, ts, receiver_id=frame.receiver_id)
 
         elif df_val == 11:
             if not common.crc_check(msg):
@@ -186,7 +288,7 @@ class StateEngine:
             icao = common.icao_from_squitter(msg)
             self._squitter_roster[icao] = ts
             ac = self._get_or_create_aircraft(icao, ts)
-            ac.update_seen(ts, df_val, frame.rssi_dbfs)
+            ac.update_seen(ts, df_val, frame.rssi_dbfs, receiver_id=frame.receiver_id)
 
         elif df_val in (0, 4, 5, 16, 20, 21):
             # Address-parity. Recover ICAO and validate against roster.
@@ -196,7 +298,7 @@ class StateEngine:
                 self.frames_dropped += 1
                 return
             ac = self._get_or_create_aircraft(icao, ts)
-            ac.update_seen(ts, df_val, frame.rssi_dbfs)
+            ac.update_seen(ts, df_val, frame.rssi_dbfs, receiver_id=frame.receiver_id)
 
             if df_val in (0, 4, 16, 20):
                 alt = ms.altitude_code(msg)
@@ -278,7 +380,8 @@ class StateEngine:
     # ADS-B handler
     # -----------------------------------------------------------------
 
-    def _handle_adsb(self, ac: Aircraft, msg: str, ts: float) -> None:
+    def _handle_adsb(self, ac: Aircraft, msg: str, ts: float,
+                     receiver_id: str = DEFAULT_RECEIVER_ID) -> None:
         tc = adsb.typecode(msg)
 
         if 1 <= tc <= 4:
@@ -303,7 +406,12 @@ class StateEngine:
                 else:
                     ac.alt_gnss_ft = alt
 
-            # CPR handling
+            # CPR handling.  Local decode is safe across receivers
+            # (uses ac.lat/lon as the reference and is robust to clock
+            # drift between feeds).  Global decode is constrained to
+            # SAME-receiver halves only — pairing an even from RX-A
+            # with an odd from RX-B can yield a wildly wrong fix when
+            # the two feeds have wall-clock skew.
             f = adsb.cpr_format(msg)
             lat_cpr, lon_cpr = adsb.cpr_lat_lon(msg)
             entry = (ts, lat_cpr, lon_cpr, msg)
@@ -319,10 +427,11 @@ class StateEngine:
                     position = None
 
             if position is None:
-                # Try global decode with stored complementary frame.
+                # Try global decode with the same receiver's
+                # complementary frame.
                 if f == 0:
-                    other = ac._cpr_odd
-                    ac._cpr_even = entry
+                    other = ac._cpr_odd.get(receiver_id)
+                    ac._cpr_even[receiver_id] = entry
                     if other and (ts - other[0]) < CPR_PAIR_WINDOW:
                         try:
                             cand = adsb.position_global(msg, other[3], ts, other[0])
@@ -331,8 +440,8 @@ class StateEngine:
                         except Exception:
                             pass
                 else:
-                    other = ac._cpr_even
-                    ac._cpr_odd = entry
+                    other = ac._cpr_even.get(receiver_id)
+                    ac._cpr_odd[receiver_id] = entry
                     if other and (ts - other[0]) < CPR_PAIR_WINDOW:
                         try:
                             cand = adsb.position_global(other[3], msg, other[0], ts)
@@ -786,13 +895,25 @@ class StateEngine:
     # -----------------------------------------------------------------
 
     def _is_plausible(self, ac: Aircraft, lat: float, lon: float, t: float) -> bool:
-        """Receiver-range check + previous-fix sanity check."""
+        """Receiver-range check + previous-fix sanity check.
+
+        With multiple receivers, the candidate position is plausible if
+        it falls within `max_range_nm` of *at least one* registered
+        receiver — overlapping coverage means a fix can be valid as
+        long as some feeder could plausibly hear it.  When no receiver
+        has a known location, the range check is skipped entirely.
+        """
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return False
 
-        if self.receiver_lat is not None and self.receiver_lon is not None:
-            d = _haversine_nm(self.receiver_lat, self.receiver_lon, lat, lon)
-            if d > self.max_range_nm:
+        anchored = [r for r in self.receivers
+                    if r.lat is not None and r.lon is not None]
+        if anchored:
+            in_range = any(
+                _haversine_nm(r.lat, r.lon, lat, lon) <= r.max_range_nm
+                for r in anchored
+            )
+            if not in_range:
                 return False
 
         if (
@@ -815,14 +936,21 @@ class StateEngine:
     # -----------------------------------------------------------------
 
     def _emit_update(self, ac: Aircraft) -> None:
+        payload = ac.to_dict()
+        # Persist before broadcasting so reload-on-restart sees the
+        # same state the UI just rendered.
+        if self.store is not None:
+            self.store.upsert_aircraft(payload)
         for cb in self._listeners:
             try:
-                cb({"type": "update", "icao": ac.icao, "data": ac.to_dict()})
+                cb({"type": "update", "icao": ac.icao, "data": payload})
             except Exception:
                 log.exception("listener failed")
 
     def _log_event(self, ev: dict) -> None:
         self.events.append(ev)
+        if self.store is not None:
+            self.store.log_event(ev)
         for cb in self._listeners:
             try:
                 cb({"type": "event", "event": ev})

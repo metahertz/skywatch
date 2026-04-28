@@ -43,6 +43,7 @@
     statFrames: document.getElementById('stat-frames'),
     statRate: document.getElementById('stat-rate'),
     statDrop: document.getElementById('stat-drop'),
+    statRx: document.getElementById('stat-rx'),
     statAircraft: document.getElementById('stat-aircraft'),
     connStat: document.getElementById('conn-stat'),
   };
@@ -286,6 +287,16 @@
       }
     }
 
+    // Dominant receiver tag (the receiver currently hearing this
+    // aircraft most strongly).  Only meaningful in multi-receiver
+    // setups; degrades gracefully when by_receiver is empty.
+    if (f.has('rx')) {
+      const dom = dominantReceiver(ac);
+      if (dom) {
+        lines.push(`<div class="lbl-rx">${dom.rid}</div>`);
+      }
+    }
+
     if (!lines.length) return '';
     return `<div class="ac-label">${lines.join('')}</div>`;
   }
@@ -432,6 +443,45 @@
   }
 
   // ─── Detail pane ────────────────────────────────────────────────────
+
+  // RECEIVERS HEARING block: which receivers have heard this aircraft,
+  // with their RSSI.  Skipped entirely when only one receiver exists
+  // (single-receiver mode reads RSSI from the top-level field via the
+  // existing surveillance-quality section).  Sorted strongest-first.
+  function dominantReceiver(ac) {
+    const by = ac.by_receiver || {};
+    let best = null;
+    for (const [rid, b] of Object.entries(by)) {
+      if (!best || (b.rssi != null && b.rssi > best.rssi)) {
+        best = { rid, rssi: b.rssi, last_seen: b.last_seen };
+      }
+    }
+    return best;
+  }
+
+  function receiversBlock(ac) {
+    const by = ac.by_receiver || {};
+    const ids = Object.keys(by);
+    if (ids.length < 2) return '';   // not interesting with one RX
+    const rows = ids
+      .map(rid => ({ rid, ...by[rid] }))
+      .sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999))
+      .map(r => {
+        const rssi = r.rssi != null ? r.rssi.toFixed(1) + ' dBFS' : '—';
+        const frames = Object.values(r.msg_counts || {})
+          .reduce((s, n) => s + n, 0);
+        return `<div class="rx-row">
+          <span class="rx-id">${r.rid}</span>
+          <span class="rx-rssi">${rssi}</span>
+          <span class="rx-frames">${frames} fr</span>
+        </div>`;
+      }).join('');
+    return `
+      <div class="detail-section">
+        <h4>RECEIVERS HEARING</h4>
+        <div class="rx-list">${rows}</div>
+      </div>`;
+  }
 
   // Route enrichment block (adsbdb.com origin/destination).  Returns ''
   // if the aircraft has no route data; both detail-pane modes render it
@@ -652,6 +702,8 @@
             `<span class="df-pill">DF${df}=<span class="n">${n}</span></span>`).join('')}
         </div>
       </div>
+
+      ${receiversBlock(ac)}
     `;
   }
 
@@ -790,6 +842,8 @@
         <div class="detail-grid cols-2">${linkRows.join('')}</div>
       </div>
 
+      ${receiversBlock(ac)}
+
       <div class="detail-section detail-footer">
         <span class="detail-footer-item">BDS <span class="n">${bdsCount}</span></span>
         <span class="detail-footer-item">FRAMES <span class="n">${dfCount}</span></span>
@@ -860,6 +914,13 @@
     } else {
       msg = JSON.stringify(ev);
     }
+    // Make rows clickable when they reference a known aircraft, so the
+    // user can jump straight from a ticker entry to the detail pane.
+    if (ev.icao) {
+      cls += (cls ? ' ' : '') + 'ev-clickable';
+      li.dataset.icao = ev.icao;
+      li.addEventListener('click', () => selectAircraft(li.dataset.icao));
+    }
     li.className = cls;
     li.innerHTML = `<span class="ev-t">${t}</span><span class="ev-msg">${msg}</span>`;
     el.eventLog.insertBefore(li, el.eventLog.firstChild);
@@ -883,7 +944,7 @@
         .toISOString().substr(11, 8);
       const dur = ev.ended_at ? ` (${(ev.ended_at - ev.started_at).toFixed(1)}s)` :
                                  ' (active)';
-      return `<div class="ra-event">
+      return `<div class="ra-event ev-clickable" data-icao="${ev.icao || ''}">
         <span class="ra-when">${when}${dur}</span>
         <span class="ra-icao">${ev.callsign || ev.icao}</span>
         <span class="ra-cmd">${ev.summary || ''}</span>
@@ -891,6 +952,11 @@
         <span class="ra-source">${ev.source || ''}</span>
       </div>`;
     }).join('');
+    el.raTimeline.querySelectorAll('.ra-event[data-icao]').forEach(row => {
+      const icao = row.dataset.icao;
+      if (!icao) return;
+      row.addEventListener('click', () => selectAircraft(icao));
+    });
   }
 
   // ─── Stats display ──────────────────────────────────────────────────
@@ -934,18 +1000,7 @@
     if (rx.lat != null && rx.lon != null) {
       el.rxInfo.innerHTML =
         `RX: ${rx.lat.toFixed(3)}, ${rx.lon.toFixed(3)} · range ${rx.max_range_nm}NM`;
-      // Range ring
-      rangeRingLayer.clearLayers();
-      L.circle([rx.lat, rx.lon], {
-        radius: rx.max_range_nm * 1852,
-        className: 'range-ring',
-        color: '#3d5854',
-        weight: 1,
-        dashArray: '1 4',
-        fill: false,
-        interactive: false,
-      }).addTo(rangeRingLayer);
-      // Recentre on receiver if first time
+      // Recentre on the primary receiver on first sight.
       if (!state.receiverCentred) {
         map.setView([rx.lat, rx.lon], 8);
         state.receiverCentred = true;
@@ -955,12 +1010,60 @@
     }
   }
 
+  // Render every registered receiver's range ring on the map.  Each
+  // ring is colour-coded so multi-receiver setups can tell at a glance
+  // which area is covered by which feed.  Disconnected receivers are
+  // drawn dimmer.
+  const RX_RING_COLOURS = ['#79ddc1', '#5ae0ff', '#f5b83d', '#d077ff', '#b8f5d0'];
+
+  function updateReceivers(receivers) {
+    state.receivers = receivers || [];
+    rangeRingLayer.clearLayers();
+    let connected = 0;
+    state.receivers.forEach((rx, i) => {
+      if (rx.connected) connected++;
+      if (rx.lat == null || rx.lon == null) return;
+      const colour = RX_RING_COLOURS[i % RX_RING_COLOURS.length];
+      L.circle([rx.lat, rx.lon], {
+        radius: rx.max_range_nm * 1852,
+        className: 'range-ring',
+        color: colour,
+        weight: 1,
+        opacity: rx.connected ? 0.6 : 0.2,
+        dashArray: '1 4',
+        fill: false,
+        interactive: false,
+      }).addTo(rangeRingLayer);
+      // Tiny RX marker at the centre, with the receiver name on hover.
+      L.circleMarker([rx.lat, rx.lon], {
+        radius: 3,
+        color: colour,
+        fillColor: colour,
+        fillOpacity: 0.6,
+        weight: 1,
+        interactive: true,
+      }).bindTooltip(`${rx.name || rx.id} (${rx.connected ? 'on' : 'off'})`,
+                      { permanent: false, direction: 'top' })
+        .addTo(rangeRingLayer);
+    });
+    // Topbar RECEIVERS stat: only relevant when more than one
+    // receiver is configured (single-RX setups already see LINK).
+    if (state.receivers.length > 1) {
+      el.statRx.hidden = false;
+      el.statRx.querySelector('.val').textContent =
+        `${connected}/${state.receivers.length}`;
+    } else {
+      el.statRx.hidden = true;
+    }
+  }
+
   // ─── WebSocket protocol handler ─────────────────────────────────────
 
   function handleSnapshot(msg) {
     state.aircraft.clear();
     for (const ac of msg.aircraft || []) state.aircraft.set(ac.icao, ac);
     if (msg.receiver) updateRxInfo(msg.receiver);
+    if (msg.receivers) updateReceivers(msg.receivers);
     if (msg.stats) updateStats(msg.stats);
     if (msg.config) applyConfig(msg.config);
     if (msg.tcas_events) {

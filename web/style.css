@@ -347,6 +347,7 @@ body::before {
 .ac-label .lbl-hdg { color: var(--fg-dim); margin-left: 4px; }
 .ac-label .lbl-sqk { color: var(--amber); margin-left: 4px; font-size: 9px; }
 .ac-label .lbl-route { color: var(--amber-bright); font-size: 9px; }
+.ac-label .lbl-rx { color: var(--fg-faint); font-size: 8.5px; letter-spacing: 0.05em; }
 
 /* Trail */
 .ac-trail {
@@ -896,6 +897,26 @@ body::before {
   letter-spacing: 0.04em;
 }
 
+/* RECEIVERS HEARING block: shown in the detail pane only when more than
+ * one receiver is configured.  Each row lists the receiver's stable
+ * ID, its current RSSI for this aircraft, and the per-receiver frame
+ * count.  Sorted strongest-first by the renderer. */
+.rx-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.rx-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  column-gap: 12px;
+  font-size: 10.5px;
+  line-height: 1.3;
+}
+.rx-row .rx-id     { color: var(--fg-bright); }
+.rx-row .rx-rssi   { color: var(--cyan); font-variant-numeric: tabular-nums; }
+.rx-row .rx-frames { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+
 /* Compact-view footer: tiny one-liner replacing the BDS-pills /
  * DF-counts sections that the VERBOSE view shows in full. */
 .detail-footer {
@@ -962,6 +983,14 @@ body::before {
 
 #event-log .ev-t { color: var(--fg-dim); font-size: 9px; }
 #event-log .ev-msg { color: var(--fg-primary); }
+
+/* Clickable ticker / RA-timeline rows that reference an aircraft.
+ * Click to jump straight to its detail pane. */
+.ev-clickable { cursor: pointer; }
+#event-log li.ev-clickable:hover,
+#ra-timeline .ra-event.ev-clickable:hover {
+  background: var(--bg-hover);
+}
 #event-log li.ev-tcas .ev-msg { color: var(--red-bright); }
 #event-log li.ev-emerg .ev-msg { color: var(--amber-bright); }
 

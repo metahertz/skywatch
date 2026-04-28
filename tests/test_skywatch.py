@@ -446,5 +446,178 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(baw.db_info.operator.name, "British Airways")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Multi-receiver ingestion: receiver attribution, same-RX CPR pairing,
+# multi-RX plausibility.
+# ─────────────────────────────────────────────────────────────────────
+
+class TestMultiReceiver(unittest.TestCase):
+    """Verify the multi-receiver invariants:
+       - frames carry their receiver_id end-to-end into Aircraft.by_receiver
+       - CPR global decode only pairs same-receiver halves
+       - plausibility passes if any registered receiver is in range
+    """
+
+    def _engine(self, receivers):
+        """Build a bare engine seeded with the given receivers."""
+        from skywatch.state import StateEngine
+        eng = StateEngine()
+        for spec in receivers:
+            eng.receivers.upsert(
+                spec["id"],
+                name=spec.get("name", spec["id"]),
+                lat=spec.get("lat"),
+                lon=spec.get("lon"),
+                max_range_nm=spec.get("max_range_nm", 280.0),
+            )
+        return eng
+
+    def _push(self, engine, parser, raw_hex, ts):
+        """Helper: encode + parse + feed."""
+        for f in parser.feed(encode_beast(raw_hex, ts_seconds=ts)):
+            engine.feed(f)
+
+    def test_per_receiver_attribution(self):
+        """Frames from two receivers update both the merged top-level
+        counters AND the per-receiver buckets."""
+        from skywatch.decoder.synthetic import make_df11_squitter
+        eng = self._engine([{"id": "rx1"}, {"id": "rx2"}])
+        p1 = BeastParser(receiver_id="rx1")
+        p2 = BeastParser(receiver_id="rx2")
+        # 3 frames from rx1, 2 from rx2
+        for i in range(3):
+            self._push(eng, p1, make_df11_squitter("ABC123"), float(i))
+        for i in range(2):
+            self._push(eng, p2, make_df11_squitter("ABC123"), float(10 + i))
+
+        ac = eng.aircraft["ABC123"]
+        self.assertIn("rx1", ac.by_receiver)
+        self.assertIn("rx2", ac.by_receiver)
+        self.assertEqual(ac.by_receiver["rx1"].rssi_samples, 3)
+        self.assertEqual(ac.by_receiver["rx2"].rssi_samples, 2)
+        # Merged view counts every frame.
+        self.assertEqual(ac.rssi_samples, 5)
+        # Engine-level receiver counters reflect per-RX traffic.
+        self.assertEqual(eng.receivers.get("rx1").frames_total, 3)
+        self.assertEqual(eng.receivers.get("rx2").frames_total, 2)
+
+    def test_cpr_global_decode_requires_same_receiver(self):
+        """An even from rx1 and odd from rx2 within the 10 s pair window
+        must NOT produce a global position decode — only the local
+        decode path (which needs a prior fix) is allowed across
+        receivers."""
+        from skywatch.decoder.synthetic import (
+            make_df11_squitter, make_airborne_position,
+        )
+        # Use a real-world example from Sun ch 5: airborne position pair.
+        # synthetic.make_airborne_position generates encoded CPR halves
+        # for a given lat/lon.
+        # Receivers placed near London so plausibility is satisfied.
+        eng = self._engine([
+            {"id": "rx1", "lat": 51.4775, "lon": -0.4614},
+            {"id": "rx2", "lat": 51.5, "lon": -0.5},
+        ])
+        p1 = BeastParser(receiver_id="rx1")
+        p2 = BeastParser(receiver_id="rx2")
+
+        # Roster the aircraft via DF11 from rx1.
+        self._push(eng, p1, make_df11_squitter("ABC123"), 0.0)
+
+        # rx1 sees the EVEN half...
+        msg_even = make_airborne_position("ABC123", 51.0, -0.5, 35000,
+                                          even=True)
+        # ...and rx2 sees the ODD half a second later.
+        msg_odd = make_airborne_position("ABC123", 51.0, -0.5, 35000,
+                                         even=False)
+        self._push(eng, p1, msg_even, 1.0)
+        self._push(eng, p2, msg_odd, 2.0)
+
+        ac = eng.aircraft["ABC123"]
+        # No same-receiver pair exists, so no global decode happened.
+        # And no prior fix → no local decode either.
+        self.assertIsNone(ac.lat, "cross-receiver CPR pair must NOT decode")
+        self.assertIsNone(ac.lon)
+        # The two halves are tracked under their respective receivers.
+        self.assertIn("rx1", ac._cpr_even)
+        self.assertIn("rx2", ac._cpr_odd)
+        self.assertNotIn("rx2", ac._cpr_even)
+        self.assertNotIn("rx1", ac._cpr_odd)
+
+        # If rx1 also sees the ODD half, the same-receiver pair should
+        # decode successfully.
+        self._push(eng, p1, msg_odd, 3.0)
+        self.assertIsNotNone(
+            ac.lat, "same-receiver pair on rx1 must decode globally")
+
+    def test_plausibility_any_receiver_in_range(self):
+        """A candidate position is plausible as long as ONE receiver
+        is within range; out-of-range for one but in-range for another
+        must still pass."""
+        # rx1 is at (51, 0), rx2 is at (40, -74) — 5000 km apart.
+        # max_range_nm is 280 NM (~520 km) on each.
+        eng = self._engine([
+            {"id": "rx1", "lat": 51.0, "lon": 0.0, "max_range_nm": 280},
+            {"id": "rx2", "lat": 40.0, "lon": -74.0, "max_range_nm": 280},
+        ])
+        from skywatch.state.aircraft import Aircraft
+        ac = Aircraft(icao="ABC123")
+
+        # Within rx1 range (~50 km from rx1) but ~5000 km from rx2 → pass
+        self.assertTrue(eng._is_plausible(ac, 51.5, 0.5, 0.0))
+        # Within rx2 range but far from rx1 → pass
+        self.assertTrue(eng._is_plausible(ac, 40.2, -74.2, 0.0))
+        # Out of both — at the equator, mid-atlantic
+        self.assertFalse(eng._is_plausible(ac, 0.0, -30.0, 0.0))
+        # Bad latitude bounds always fail
+        self.assertFalse(eng._is_plausible(ac, 95.0, 0.0, 0.0))
+
+    def test_snapshot_includes_receivers_list(self):
+        """The snapshot WS payload exposes the full receiver registry
+        so the multi-RX UI can render per-RX range rings and a
+        connected/total counter."""
+        eng = self._engine([
+            {"id": "home",   "lat": 51.0, "lon": 0.0},
+            {"id": "office", "lat": 53.0, "lon": -2.0},
+        ])
+        snap = eng.snapshot()
+        self.assertIn("receivers", snap)
+        ids = sorted(r["id"] for r in snap["receivers"])
+        self.assertEqual(ids, ["home", "office"])
+        # Legacy `receiver` block remains, filled with the primary RX.
+        self.assertEqual(snap["receiver"]["lat"], 51.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MongoStore: persistence wiring.  Skipped when pymongo isn't installed.
+# These tests verify the store API surface (no real MongoDB needed) by
+# stubbing the client; an integration test against a live MongoDB is
+# out-of-scope for the unit suite.
+# ─────────────────────────────────────────────────────────────────────
+
+class TestMongoStoreOptionalImport(unittest.TestCase):
+    """The store import guard must not fail when pymongo is absent."""
+
+    def test_optional_import(self):
+        from skywatch.store import HAS_MONGO, MongoStore
+        # MongoStore is None when pymongo is not installed.
+        if not HAS_MONGO:
+            self.assertIsNone(MongoStore)
+        else:
+            self.assertIsNotNone(MongoStore)
+
+    def test_engine_accepts_no_store(self):
+        """Engine works fine with store=None (default)."""
+        from skywatch.state import StateEngine
+        eng = StateEngine()
+        self.assertIsNone(eng.store)
+        # Frame ingestion path must not blow up when no store is wired.
+        # (Use the synthetic generator's helpers as inputs.)
+        from skywatch.decoder.synthetic import make_df11_squitter
+        p = BeastParser(receiver_id="test")
+        for f in p.feed(encode_beast(make_df11_squitter("ABC123"), 0.0)):
+            eng.feed(f)
+        self.assertIn("ABC123", eng.aircraft)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

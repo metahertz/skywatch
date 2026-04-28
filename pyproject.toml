@@ -27,6 +27,11 @@ classifiers = [
 # No runtime dependencies — pure stdlib.
 dependencies = []
 
+[project.optional-dependencies]
+# Persistence layer.  Install with `pip install skywatch[mongo]` or
+# `pip install pymongo` if you want to enable --mongo.
+mongo = ["pymongo>=4.0"]
+
 [project.scripts]
 skywatch = "skywatch.__main__:main"
 

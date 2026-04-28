@@ -36,13 +36,27 @@ class BeastFrame:
     timestamp: float       # seconds, monotonic-ish
     rssi_dbfs: float       # negative number, 0 = full scale
     msg_type: int          # 0x31/0x32/0x33
+    # Receiver this frame arrived from.  Stable string ID assigned by the
+    # caller (parser is constructed with one).  When skywatch is ingesting
+    # from a single source this is just a constant; with multiple BEAST
+    # feeds, the engine uses it to attribute every per-aircraft signal
+    # (RSSI / msg_counts / first/last_seen) and to constrain CPR pairing
+    # to same-receiver halves only.
+    receiver_id: str = "default"
+
+
+# Default tag when nothing else is known about the source.  Callers that
+# care about receiver attribution (multi-receiver mode) should always
+# pass an explicit receiver_id.
+DEFAULT_RECEIVER_ID = "default"
 
 
 class BeastParser:
     """Stateful parser that consumes bytes and yields BeastFrame objects."""
 
-    def __init__(self) -> None:
+    def __init__(self, receiver_id: str = DEFAULT_RECEIVER_ID) -> None:
         self._buf = bytearray()
+        self._receiver_id = receiver_id
 
     def feed(self, data: bytes) -> list[BeastFrame]:
         """Append raw bytes, return any complete frames found."""
@@ -92,6 +106,7 @@ class BeastParser:
                 timestamp=timestamp,
                 rssi_dbfs=rssi,
                 msg_type=t,
+                receiver_id=self._receiver_id,
             )
             del self._buf[: i + 2 + consumed]
             i = 0

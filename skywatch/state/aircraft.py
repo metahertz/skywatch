@@ -20,6 +20,36 @@ class TcasEvent:
 
 
 @dataclass
+class ReceiverAttribution:
+    """Per-receiver counters for one aircraft.  Lets the UI show 'this
+    aircraft was heard by RX home with -42 dBFS, by RX office with -28
+    dBFS' and detect coverage gaps when one feed drops."""
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    msg_counts: dict = field(default_factory=lambda: defaultdict(int))
+    rssi_avg: float = -100.0
+    rssi_samples: int = 0
+
+    def update(self, timestamp: float, df: int, rssi: float) -> None:
+        self.last_seen = timestamp
+        self.msg_counts[df] += 1
+        if self.rssi_samples == 0:
+            self.rssi_avg = rssi
+        else:
+            self.rssi_avg = 0.9 * self.rssi_avg + 0.1 * rssi
+        self.rssi_samples += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "msg_counts": dict(self.msg_counts),
+            "rssi": self.rssi_avg,
+            "rssi_samples": self.rssi_samples,
+        }
+
+
+@dataclass
 class Aircraft:
     """Everything we know about one aircraft, keyed by ICAO."""
 
@@ -79,13 +109,20 @@ class Aircraft:
     tcas_ra_ended_at: float | None = None
     tcas_ra_history: list[TcasEvent] = field(default_factory=list)
 
-    # Quality / metadata
+    # Quality / metadata.  These are the *merged* counters across every
+    # receiver that has heard this aircraft (kept for back-compat with
+    # callers expecting a single-receiver view).  Per-receiver
+    # breakdowns live in `by_receiver`.
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     msg_counts: dict = field(default_factory=lambda: defaultdict(int))
     rssi_avg: float = -100.0
     rssi_samples: int = 0
     bds_observed: set = field(default_factory=set)
+
+    # Per-receiver attribution: which receivers have heard this aircraft,
+    # with their own RSSI / msg counts.  Empty before the first frame.
+    by_receiver: dict = field(default_factory=dict)
 
     # Static info from DB lookup (registration, type, country, operator).
     # This is an `AircraftInfo` instance; we store it as `Any` to avoid
@@ -118,26 +155,47 @@ class Aircraft:
     # Position trail
     trail: deque = field(default_factory=lambda: deque(maxlen=120))
 
-    # Internal: CPR pair buffer (private; not serialised)
-    _cpr_even: tuple | None = None  # (timestamp, lat_cpr, lon_cpr, msg)
-    _cpr_odd: tuple | None = None
-    _cpr_even_surface: tuple | None = None
-    _cpr_odd_surface: tuple | None = None
+    # Internal: CPR pair buffer (private; not serialised).
+    # Keyed by receiver_id so the engine can pair an even and odd half
+    # only when they came from the SAME receiver.  Cross-receiver
+    # pairing is unsafe because the wall-clock timestamps used for the
+    # 10-second pair window can drift between distributed receivers,
+    # which can produce spurious global decodes.
+    _cpr_even: dict = field(default_factory=dict)  # receiver_id -> (ts, lat_cpr, lon_cpr, msg)
+    _cpr_odd: dict = field(default_factory=dict)
+    _cpr_even_surface: dict = field(default_factory=dict)
+    _cpr_odd_surface: dict = field(default_factory=dict)
 
     # Internal: previous fix for plausibility check
     _prev_lat: float | None = None
     _prev_lon: float | None = None
     _prev_position_at: float | None = None
 
-    def update_seen(self, timestamp: float, df: int, rssi: float) -> None:
+    def update_seen(
+        self,
+        timestamp: float,
+        df: int,
+        rssi: float,
+        receiver_id: str = "default",
+    ) -> None:
+        """Record one received frame.  Updates the merged top-level
+        counters AND the per-receiver bucket so UI clients can see both
+        a single "best" RSSI and the per-RX breakdown."""
+        # Merged view (existing behaviour).
         self.last_seen = timestamp
         self.msg_counts[df] += 1
-        # Exponential moving average over RSSI
         if self.rssi_samples == 0:
             self.rssi_avg = rssi
         else:
             self.rssi_avg = 0.9 * self.rssi_avg + 0.1 * rssi
         self.rssi_samples += 1
+        # Per-receiver attribution.
+        bucket = self.by_receiver.get(receiver_id)
+        if bucket is None:
+            bucket = ReceiverAttribution(first_seen=timestamp,
+                                         last_seen=timestamp)
+            self.by_receiver[receiver_id] = bucket
+        bucket.update(timestamp, df, rssi)
 
     def record_position(self, lat: float, lon: float, t: float) -> None:
         self._prev_lat = self.lat
@@ -233,4 +291,7 @@ class Aircraft:
             "trail": list(self.trail),
             "info": info_dict,
             "route": self.route,
+            "by_receiver": {
+                rid: att.to_dict() for rid, att in self.by_receiver.items()
+            },
         }

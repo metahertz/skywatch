@@ -71,7 +71,10 @@ class AppServer:
         self._stop = threading.Event()
         self._broadcaster_thread: Optional[threading.Thread] = None
         self._snapshotter_thread: Optional[threading.Thread] = None
+        # Single-receiver mode keeps `_input_thread` set for back-compat.
+        # Multi-receiver mode appends every BEAST client to `_input_threads`.
         self._input_thread: Optional[threading.Thread] = None
+        self._input_threads: list[threading.Thread] = []
 
     # ------------------------------------------------------------------
     # Listener wiring
@@ -167,46 +170,72 @@ class AppServer:
         )
         self._snapshotter_thread.start()
 
-    def start_beast_client(self, host: str, port: int) -> None:
+    def start_beast_client(
+        self,
+        host: str,
+        port: int,
+        receiver_id: str | None = None,
+    ) -> None:
         """Connect to a remote BEAST source (typically dump1090 on :30005).
         Reconnects automatically if the connection drops.
-        """
-        self._input_thread = threading.Thread(
-            target=self._beast_client_loop,
-            args=(host, port),
-            daemon=True,
-            name="skywatch-beast-input",
-        )
-        self._input_thread.start()
 
-    def _beast_client_loop(self, host: str, port: int) -> None:
+        `receiver_id` is the stable string used to tag every frame
+        produced by this connection.  Defaults to "host:port" when
+        unspecified; AppServer can manage many concurrent clients,
+        each with a distinct receiver_id, when the user has more than
+        one --beast configured.
+        """
+        rid = receiver_id or f"{host}:{port}"
+        thread = threading.Thread(
+            target=self._beast_client_loop,
+            args=(host, port, rid),
+            daemon=True,
+            name=f"skywatch-beast-{rid}",
+        )
+        # Track every input thread so multi-receiver setups can shut
+        # down cleanly.  `_input_thread` retained for back-compat.
+        self._input_thread = thread
+        self._input_threads.append(thread)
+        thread.start()
+
+    def _beast_client_loop(
+        self, host: str, port: int, receiver_id: str,
+    ) -> None:
         """Runs in a thread; reconnects with exponential backoff on failure."""
         backoff = 1.0
         while not self._stop.is_set():
             sock = None
             try:
-                log.info("Connecting to BEAST source at %s:%d ...", host, port)
+                log.info("[%s] Connecting to BEAST source at %s:%d ...",
+                         receiver_id, host, port)
                 sock = socket.create_connection((host, port), timeout=5)
                 sock.settimeout(None)
-                log.info("Connected to BEAST source at %s:%d", host, port)
+                log.info("[%s] Connected to BEAST source at %s:%d",
+                         receiver_id, host, port)
                 backoff = 1.0  # reset on success
-                parser = BeastParser()
+                # Tag every frame with this client's receiver_id.
+                parser = BeastParser(receiver_id=receiver_id)
                 while not self._stop.is_set():
                     chunk = sock.recv(8192)
                     if not chunk:
-                        log.warning("BEAST source closed the connection")
+                        log.warning("[%s] BEAST source closed the connection",
+                                    receiver_id)
                         break
                     for frame in parser.feed(chunk):
                         self.engine.feed(frame)
             except (OSError, ConnectionError) as e:
-                log.warning("BEAST client error: %s — reconnecting in %.1fs",
-                            e, backoff)
+                log.warning("[%s] BEAST client error: %s — reconnecting in %.1fs",
+                            receiver_id, e, backoff)
             finally:
                 if sock:
                     try:
                         sock.close()
                     except OSError:
                         pass
+                # Mark the receiver as disconnected.
+                rx = self.engine.receivers.get(receiver_id)
+                if rx is not None:
+                    rx.connected = False
             # Backoff before reconnect
             if not self._stop.is_set():
                 self._stop.wait(backoff)
@@ -223,8 +252,18 @@ class AppServer:
             self.engine.receiver_lat = scn.receiver_lat
             self.engine.receiver_lon = scn.receiver_lon
 
+        # Synthetic feed gets a stable receiver_id so the engine's
+        # multi-receiver bookkeeping has something coherent to attribute
+        # frames to (rather than every test creating a fresh "default"
+        # entry by accident).
+        SYNTH_RID = "synthetic"
+        self.engine.receivers.upsert(
+            SYNTH_RID, name="synthetic",
+            lat=scn.receiver_lat, lon=scn.receiver_lon,
+        )
+
         def _runner():
-            parser = BeastParser()
+            parser = BeastParser(receiver_id=SYNTH_RID)
             tick = 0
             while not self._stop.is_set():
                 tick += 1
