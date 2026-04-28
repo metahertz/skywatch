@@ -1,0 +1,789 @@
+/* SKYWATCH - ATC console aesthetic
+ *
+ * Inspired by ARTS / STARS / MRT-style plan-view displays:
+ * dense monospaced data, phosphor green and amber, no decorative chrome,
+ * faint scan-line texture for atmosphere.
+ */
+
+:root {
+  --bg-deep:        #06090a;       /* CRT housing background */
+  --bg-pane:        #0b1113;       /* phosphor envelope */
+  --bg-cell:        #0f1719;
+  --bg-hover:       #142023;
+  --bg-active:      #1a2c30;
+
+  --grid-line:      rgba(40, 80, 90, 0.20);
+  --grid-line-bright: rgba(80, 200, 200, 0.10);
+
+  --fg-primary:     #b8f5d0;       /* P39 phosphor green */
+  --fg-bright:      #e0ffec;
+  --fg-dim:         #6a8a82;
+  --fg-faint:       #3d5854;
+
+  --amber:          #f5b83d;       /* P3 amber for warnings/SSR */
+  --amber-bright:   #ffd070;
+  --red:            #ff4848;       /* TCAS / emergency */
+  --red-bright:     #ff7070;
+  --cyan:           #5ae0ff;       /* high-altitude tag */
+
+  --fl-low:         #f0f0f0;
+  --fl-mid:         #e8c873;
+  --fl-cruise:      #79ddc1;
+  --fl-high:        #5ae0ff;
+  --fl-very-high:   #d077ff;
+
+  --font-mono:      "JetBrains Mono", "IBM Plex Mono", "Menlo", monospace;
+  --font-display:   "JetBrains Mono", "IBM Plex Mono", monospace;
+
+  --hairline:       1px solid rgba(120, 200, 200, 0.12);
+  --hairline-strong: 1px solid rgba(120, 200, 200, 0.25);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-deep);
+  color: var(--fg-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-feature-settings: "tnum" 1, "ss01" 1;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+}
+
+/* Subtle scan-line atmosphere (purely cosmetic, very faint) */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.07) 3px
+  );
+  z-index: 9999;
+  mix-blend-mode: multiply;
+}
+
+/* ─────────────────────────────────────────────────────────────────── */
+
+#app {
+  display: grid;
+  grid-template-rows: 36px 1fr;
+  height: 100vh;
+}
+
+/* ─── TOP BAR ────────────────────────────────────────────────────── */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  background: var(--bg-pane);
+  border-bottom: var(--hairline-strong);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.brand-glyph {
+  color: var(--amber);
+  font-size: 16px;
+  text-shadow: 0 0 6px rgba(245, 184, 61, 0.5);
+}
+
+.brand-name {
+  color: var(--fg-bright);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  font-size: 13px;
+}
+
+.brand-sub {
+  color: var(--fg-dim);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.status {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.05;
+}
+
+.stat .lbl {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+}
+
+.stat .val {
+  color: var(--fg-bright);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+#conn-stat .val { color: var(--red); }
+#conn-stat.ok .val { color: var(--fg-primary); }
+
+/* ─── MAIN GRID ──────────────────────────────────────────────────── */
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 320px 360px;
+  grid-template-rows: 1fr 200px 140px;
+  grid-template-areas:
+    "map list detail"
+    "map events detail"
+    "ra ra ra";
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+}
+
+.map-pane    { grid-area: map; position: relative; }
+.list-pane   { grid-area: list; }
+.detail-pane { grid-area: detail; }
+.events-pane { grid-area: events; }
+.ra-pane     { grid-area: ra; }
+
+.list-pane, .detail-pane, .events-pane, .ra-pane {
+  background: var(--bg-pane);
+  border-left: var(--hairline-strong);
+  border-top: var(--hairline-strong);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ─── MAP ────────────────────────────────────────────────────────── */
+
+#map {
+  width: 100%;
+  height: 100%;
+  background: var(--bg-deep);
+}
+
+/* Override Leaflet defaults to fit the aesthetic */
+.leaflet-container {
+  background: var(--bg-deep) !important;
+  font-family: var(--font-mono) !important;
+}
+
+.leaflet-tile-pane { filter: invert(0.92) hue-rotate(170deg) saturate(0.5) brightness(0.7); }
+
+.leaflet-control-attribution {
+  background: rgba(11, 17, 19, 0.85) !important;
+  color: var(--fg-dim) !important;
+  font-size: 9px !important;
+  border: var(--hairline);
+  padding: 2px 6px !important;
+}
+.leaflet-control-attribution a { color: var(--fg-primary) !important; }
+
+.leaflet-control-zoom {
+  border: var(--hairline-strong) !important;
+  background: var(--bg-pane);
+}
+.leaflet-control-zoom a {
+  background: var(--bg-pane) !important;
+  color: var(--fg-primary) !important;
+  border-bottom: var(--hairline) !important;
+  font-family: var(--font-mono) !important;
+}
+.leaflet-control-zoom a:hover {
+  background: var(--bg-hover) !important;
+  color: var(--fg-bright) !important;
+}
+
+/* Aircraft marker */
+.ac-marker {
+  position: absolute;
+  width: 0; height: 0;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.ac-marker svg {
+  position: absolute;
+  left: -10px;
+  top: -10px;
+  width: 20px;
+  height: 20px;
+  transform-origin: 10px 10px;
+  overflow: visible;
+}
+
+.ac-marker .ac-icon {
+  fill: var(--fg-primary);
+  stroke: var(--bg-deep);
+  stroke-width: 0.5;
+  filter: drop-shadow(0 0 2px currentColor);
+  transition: fill 0.4s ease;
+}
+
+.ac-marker.fl-0 .ac-icon { fill: var(--fl-low); color: var(--fl-low); }
+.ac-marker.fl-1 .ac-icon { fill: var(--fl-mid); color: var(--fl-mid); }
+.ac-marker.fl-2 .ac-icon { fill: var(--fl-cruise); color: var(--fl-cruise); }
+.ac-marker.fl-3 .ac-icon { fill: var(--fl-cruise); color: var(--fl-cruise); }
+.ac-marker.fl-4 .ac-icon { fill: var(--fl-high); color: var(--fl-high); }
+.ac-marker.fl-5 .ac-icon { fill: var(--fl-very-high); color: var(--fl-very-high); }
+
+.ac-marker.tcas-ra .ac-icon {
+  fill: var(--red-bright) !important;
+  color: var(--red-bright);
+  filter: drop-shadow(0 0 5px var(--red)) drop-shadow(0 0 10px var(--red));
+  animation: tcas-pulse 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes tcas-pulse {
+  from { transform: scale(1); }
+  to { transform: scale(1.3); }
+}
+
+.ac-marker.selected .ac-icon {
+  stroke: var(--amber);
+  stroke-width: 1.5;
+}
+
+.ac-label {
+  position: absolute;
+  left: 12px;
+  top: -8px;
+  font-size: 9.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  color: var(--fg-bright);
+  text-shadow:
+    1px 0 0 var(--bg-deep),
+    -1px 0 0 var(--bg-deep),
+    0 1px 0 var(--bg-deep),
+    0 -1px 0 var(--bg-deep);
+  line-height: 1.1;
+  pointer-events: none;
+}
+
+.ac-label .lbl-cs { color: var(--fg-bright); font-weight: 600; }
+.ac-label .lbl-alt { color: var(--cyan); }
+.ac-label .lbl-spd { color: var(--fg-primary); }
+.ac-label .lbl-vrate { color: var(--fg-dim); margin-left: 2px; }
+
+/* Trail */
+.ac-trail {
+  fill: none;
+  stroke: var(--fg-primary);
+  stroke-width: 1;
+  stroke-opacity: 0.5;
+}
+
+/* Heading vector */
+.ac-vector {
+  stroke: var(--fg-dim);
+  stroke-width: 1;
+  stroke-dasharray: 2 2;
+  fill: none;
+}
+
+/* TCAS pair link */
+.tcas-link {
+  stroke: var(--red);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+  fill: none;
+  animation: tcas-link-pulse 1s ease-in-out infinite alternate;
+}
+
+@keyframes tcas-link-pulse {
+  from { stroke-opacity: 0.4; }
+  to { stroke-opacity: 1; }
+}
+
+/* Range ring */
+.range-ring {
+  fill: none;
+  stroke: var(--fg-faint);
+  stroke-width: 1;
+  stroke-dasharray: 1 4;
+}
+
+/* Map overlay panels */
+.overlay {
+  position: absolute;
+  z-index: 500;
+  background: rgba(11, 17, 19, 0.85);
+  border: var(--hairline-strong);
+  padding: 8px 10px;
+  font-size: 10px;
+  color: var(--fg-primary);
+  backdrop-filter: blur(2px);
+}
+
+.overlay-tl { top: 8px; left: 8px; }
+.overlay-bl { bottom: 8px; left: 8px; }
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: 0.05em;
+  line-height: 1.4;
+}
+
+.lc { font-size: 11px; }
+.lc-fl0 { color: var(--fl-low); }
+.lc-fl1 { color: var(--fl-mid); }
+.lc-fl2 { color: var(--fl-cruise); }
+.lc-fl3 { color: var(--fl-high); }
+.lc-fl4 { color: var(--fl-very-high); }
+.lc-ra { color: var(--red); }
+
+.rx-info {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+/* ─── LIST PANE ──────────────────────────────────────────────────── */
+
+.list-head {
+  padding: 8px 12px;
+  border-bottom: var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.list-head h2 {
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  font-weight: 600;
+  color: var(--amber);
+}
+
+#filter {
+  background: var(--bg-cell);
+  color: var(--fg-bright);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  border: var(--hairline);
+  padding: 4px 6px;
+  outline: none;
+}
+#filter:focus { border-color: var(--amber); }
+
+.list-cols, #aircraft-list li {
+  display: grid;
+  grid-template-columns: 60px 70px 50px 50px 45px 40px;
+  gap: 6px;
+  padding: 3px 12px;
+  font-size: 11px;
+  align-items: center;
+}
+
+.list-cols {
+  color: var(--fg-dim);
+  border-bottom: var(--hairline);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+#aircraft-list {
+  list-style: none;
+  overflow-y: auto;
+  flex: 1;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+
+#aircraft-list li {
+  cursor: pointer;
+  border-bottom: 1px solid rgba(120, 200, 200, 0.04);
+}
+
+#aircraft-list li:hover { background: var(--bg-hover); }
+
+#aircraft-list li.selected { background: var(--bg-active); }
+
+#aircraft-list li.tcas-ra {
+  background: rgba(255, 72, 72, 0.08);
+  border-left: 2px solid var(--red);
+  padding-left: 10px;
+}
+
+#aircraft-list .icao { color: var(--fg-dim); }
+#aircraft-list .cs   { color: var(--fg-bright); font-weight: 500; }
+#aircraft-list .typ  { color: var(--fg-primary); }
+#aircraft-list .fl   { color: var(--cyan); font-variant-numeric: tabular-nums; }
+#aircraft-list .gs   { color: var(--fg-primary); font-variant-numeric: tabular-nums; }
+#aircraft-list .bds  { color: var(--amber); font-size: 9px; }
+
+/* ─── DETAIL PANE ────────────────────────────────────────────────── */
+
+.detail-pane {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+
+.detail-empty {
+  padding: 24px;
+  color: var(--fg-dim);
+  font-size: 11px;
+  text-align: center;
+  margin-top: 40%;
+}
+
+.detail-header {
+  padding: 12px 14px;
+  border-bottom: var(--hairline-strong);
+  background: var(--bg-cell);
+}
+
+.detail-header .icao-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.detail-header .icao {
+  color: var(--fg-dim);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+}
+
+.detail-header .cs {
+  color: var(--amber-bright);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.detail-header .reg {
+  color: var(--fg-bright);
+  font-size: 12px;
+}
+
+.detail-header .reg-src {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  margin-left: 4px;
+}
+
+.detail-header .descr {
+  color: var(--fg-primary);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.detail-header .meta {
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.detail-header .country-flag {
+  display: inline-block;
+  background: var(--bg-active);
+  color: var(--cyan);
+  padding: 0 4px;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  margin-right: 6px;
+}
+
+.detail-header .badge {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  margin-right: 4px;
+  border: 1px solid currentColor;
+}
+
+.badge-mil  { color: var(--amber); }
+.badge-pia  { color: var(--cyan); }
+.badge-int  { color: var(--fg-bright); }
+
+.detail-section {
+  padding: 8px 14px;
+  border-bottom: var(--hairline);
+}
+
+.detail-section h4 {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.detail-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detail-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  column-gap: 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.detail-row .k {
+  color: var(--fg-dim);
+  align-self: start;
+  padding-top: 1px;
+}
+.detail-row .v {
+  color: var(--fg-bright);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Source provenance tag — shows which message(s) can populate this field.
+ * Sits below the value, right-aligned. Each source appears as a small
+ * pill that's brighter if we've actually observed that source from this
+ * aircraft, dimmer if it's only a theoretical possibility per the spec. */
+.detail-row .src {
+  grid-column: 2;
+  text-align: right;
+  white-space: nowrap;
+  margin-top: -1px;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.src-pill {
+  display: inline-block;
+  font-size: 8.5px;
+  letter-spacing: 0.04em;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+  font-feature-settings: "tnum" 1;
+}
+
+/* "obs" = source confirmed observed (BDS register decoded, or DF received) */
+.src-pill.obs {
+  color: var(--amber);
+  border-color: rgba(245, 184, 61, 0.6);
+  background: rgba(245, 184, 61, 0.08);
+}
+
+/* "cand" = candidate (possible per the spec, but not heard yet) */
+.src-pill.cand {
+  color: var(--fg-faint);
+  border-color: rgba(120, 200, 200, 0.15);
+  background: transparent;
+}
+
+/* Source tag inline in section headers, e.g. "METEOROLOGY · BDS 4,4" */
+.detail-section h4 .src {
+  font-weight: 400;
+  text-transform: none;
+  margin-left: 6px;
+}
+.detail-section h4 .src-pill {
+  font-size: 8.5px;
+}
+
+.modes-line {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--fg-primary);
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 6px;
+}
+.modes-line .modes-lbl { color: var(--fg-dim); }
+.modes-line .src {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 3px;
+}
+
+.detail-row.alert .v { color: var(--red); }
+.detail-row.amber .v { color: var(--amber); }
+
+.bds-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.bds-pill {
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  padding: 1px 5px;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+}
+
+.df-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+.df-counts .df-pill {
+  color: var(--fg-dim);
+}
+.df-counts .df-pill .n {
+  color: var(--fg-bright);
+  font-weight: 500;
+}
+
+.tcas-summary {
+  background: rgba(255, 72, 72, 0.1);
+  border: 1px solid var(--red);
+  padding: 8px;
+  margin-bottom: 6px;
+}
+
+.tcas-summary .ra-cmd {
+  color: var(--red-bright);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+}
+
+/* ─── EVENT TICKER ───────────────────────────────────────────────── */
+
+.events-pane {
+  overflow: hidden;
+}
+
+.events-pane h3 {
+  padding: 6px 12px;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  font-weight: 600;
+  color: var(--amber);
+  border-bottom: var(--hairline);
+  background: var(--bg-cell);
+}
+
+#event-log {
+  list-style: none;
+  overflow-y: auto;
+  height: 100%;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+  font-size: 10px;
+}
+
+#event-log li {
+  padding: 2px 12px;
+  border-bottom: 1px solid rgba(120, 200, 200, 0.03);
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 8px;
+  line-height: 1.4;
+}
+
+#event-log .ev-t { color: var(--fg-dim); font-size: 9px; }
+#event-log .ev-msg { color: var(--fg-primary); }
+#event-log li.ev-tcas .ev-msg { color: var(--red-bright); }
+#event-log li.ev-emerg .ev-msg { color: var(--amber-bright); }
+
+/* ─── RA TIMELINE ────────────────────────────────────────────────── */
+
+.ra-pane {
+  border-top: var(--hairline-strong);
+  border-left: none;
+  overflow: hidden;
+}
+
+.ra-pane h3 {
+  padding: 6px 12px;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  font-weight: 600;
+  color: var(--red);
+  border-bottom: var(--hairline);
+  background: var(--bg-cell);
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.ra-count {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+#ra-timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+
+.ra-empty {
+  color: var(--fg-dim);
+  font-size: 10px;
+  text-align: center;
+  padding: 30px;
+  font-style: italic;
+}
+
+.ra-event {
+  display: grid;
+  grid-template-columns: 90px 80px 1fr 100px 60px;
+  gap: 12px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-left: 2px solid var(--red);
+  background: rgba(255, 72, 72, 0.04);
+  margin-bottom: 4px;
+  font-size: 11px;
+}
+
+.ra-event .ra-when { color: var(--fg-dim); font-size: 10px; }
+.ra-event .ra-icao { color: var(--fg-bright); font-weight: 500; }
+.ra-event .ra-cmd  { color: var(--red-bright); font-weight: 600; letter-spacing: 0.05em; }
+.ra-event .ra-threat { color: var(--amber); font-size: 10px; }
+.ra-event .ra-source { color: var(--fg-dim); font-size: 9px; letter-spacing: 0.1em; }
+
+/* ─── RESPONSIVE COLLAPSE ────────────────────────────────────────── */
+
+@media (max-width: 1100px) {
+  .layout {
+    grid-template-columns: 1fr 320px;
+    grid-template-areas:
+      "map list"
+      "map events"
+      "ra ra";
+  }
+  .detail-pane { display: none; }
+}

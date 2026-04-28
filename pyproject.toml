@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skywatch"
+version = "0.1.0"
+description = "1090 MHz aircraft surveillance visualiser"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "skywatch contributors" }
+]
+keywords = ["adsb", "mode-s", "tcas", "sdr", "rtl-sdr", "aviation", "1090"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Communications :: Ham Radio",
+    "Topic :: Scientific/Engineering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# No runtime dependencies — pure stdlib.
+dependencies = []
+
+[project.scripts]
+skywatch = "skywatch.__main__:main"
+
+[project.urls]
+Documentation = "https://example/skywatch"
+Source = "https://example/skywatch"
+
+[tool.setuptools.packages.find]
+include = ["skywatch*"]
+
+[tool.setuptools.package-data]
+skywatch = ["../web/*", "../data/*.gz"]

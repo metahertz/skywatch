@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Downloaded aircraft databases (run python -m skywatch.db.fetch to populate)
+data/aircraft.csv.gz
+data/operators.json
+data/types.json
+
+# Local config / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

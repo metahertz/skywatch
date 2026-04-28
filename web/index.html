@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SKYWATCH — 1090 MHz surveillance</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-glyph">▣</span>
+        <span class="brand-name">SKYWATCH</span>
+        <span class="brand-sub">1090 MHz surveillance</span>
+      </div>
+      <div class="status">
+        <div class="stat"><span class="lbl">UPTIME</span><span class="val" id="stat-uptime">—</span></div>
+        <div class="stat"><span class="lbl">FRAMES</span><span class="val" id="stat-frames">0</span></div>
+        <div class="stat"><span class="lbl">RATE</span><span class="val" id="stat-rate">0/s</span></div>
+        <div class="stat"><span class="lbl">DROP</span><span class="val" id="stat-drop">0</span></div>
+        <div class="stat"><span class="lbl">A/C</span><span class="val" id="stat-aircraft">0</span></div>
+        <div class="stat" id="conn-stat"><span class="lbl">LINK</span><span class="val">DISCONN</span></div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="map-pane">
+        <div id="map"></div>
+        <div class="overlay overlay-tl">
+          <div class="legend">
+            <div class="legend-row"><span class="lc lc-fl0">▰</span> &lt; FL100</div>
+            <div class="legend-row"><span class="lc lc-fl1">▰</span> FL100–200</div>
+            <div class="legend-row"><span class="lc lc-fl2">▰</span> FL200–300</div>
+            <div class="legend-row"><span class="lc lc-fl3">▰</span> FL300–400</div>
+            <div class="legend-row"><span class="lc lc-fl4">▰</span> &gt; FL400</div>
+            <div class="legend-row"><span class="lc lc-ra">▰</span> TCAS RA</div>
+          </div>
+        </div>
+        <div class="overlay overlay-bl">
+          <div class="rx-info" id="rx-info">RX: not configured</div>
+        </div>
+      </section>
+
+      <aside class="list-pane">
+        <div class="list-head">
+          <h2>TRAFFIC</h2>
+          <input type="text" id="filter" placeholder="filter (icao / callsign)" />
+        </div>
+        <div class="list-cols">
+          <span>HEX</span><span>FLT</span><span>TYP</span><span>FL</span><span>GS</span><span>BDS</span>
+        </div>
+        <ul id="aircraft-list"></ul>
+      </aside>
+
+      <aside class="detail-pane" id="detail-pane">
+        <div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>
+      </aside>
+
+      <section class="events-pane">
+        <h3>EVENT TICKER</h3>
+        <ul id="event-log"></ul>
+      </section>
+
+      <section class="ra-pane">
+        <h3>TCAS RA TIMELINE  <span class="ra-count" id="ra-count">0</span></h3>
+        <div id="ra-timeline">
+          <div class="ra-empty">No resolution advisories observed.</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="app.js"></script>
+</body>
+</html>
