@@ -321,6 +321,37 @@ body::before {
   stroke-width: 1.5;
 }
 
+/* Staleness on the map.  Aircraft that haven't been heard in a while
+ * are dimmed so the user can see at a glance which contacts are live
+ * vs cold.  Two tiers, matching the list: STALE (~60-180 s) and
+ * VERY_STALE (>180 s).  Engine prunes at 10 minutes regardless. */
+.ac-marker.stale .ac-icon {
+  opacity: 0.50;
+  filter: grayscale(0.6) drop-shadow(0 0 1px currentColor);
+}
+.ac-marker.stale .ac-label {
+  opacity: 0.70;
+  color: var(--fg-dim);
+}
+.ac-marker.very-stale .ac-icon {
+  opacity: 0.25;
+  filter: grayscale(1.0);
+}
+.ac-marker.very-stale .ac-label {
+  opacity: 0.45;
+  color: var(--fg-dim);
+}
+/* Selected aircraft is never dimmed — a stale + selected target stays
+ * fully visible so the operator can keep inspecting it. */
+.ac-marker.selected.stale .ac-icon,
+.ac-marker.selected.very-stale .ac-icon {
+  opacity: 1; filter: none;
+}
+.ac-marker.selected.stale .ac-label,
+.ac-marker.selected.very-stale .ac-label {
+  opacity: 1; color: var(--fg-bright);
+}
+
 .ac-label {
   position: absolute;
   left: 12px;
@@ -501,7 +532,7 @@ body::before {
   display: grid;
   /* FLT column is flex (minmax) so it can grow with the pane and host
    * the inline "ORIG→DEST" route tag without breaking the columns. */
-  grid-template-columns: 60px minmax(70px, 1fr) 50px 50px 45px 40px;
+  grid-template-columns: 60px minmax(70px, 1fr) 50px 50px 42px 50px;
   gap: 6px;
   padding: 3px 12px;
   font-size: 11px;
@@ -567,7 +598,20 @@ body::before {
 #aircraft-list .typ  { color: var(--fg-primary); }
 #aircraft-list .fl   { color: var(--cyan); font-variant-numeric: tabular-nums; }
 #aircraft-list .gs   { color: var(--fg-primary); font-variant-numeric: tabular-nums; }
-#aircraft-list .bds  { color: var(--amber); font-size: 9px; }
+#aircraft-list .last {
+  color: var(--fg-dim);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  text-align: right;
+}
+
+/* Staleness in the list: dim + warm-tinted when no frames have arrived
+ * recently, almost ghost when long stale.  Same thresholds as the map. */
+#aircraft-list li.stale       { opacity: 0.62; }
+#aircraft-list li.stale .last { color: var(--amber); }
+#aircraft-list li.very-stale  { opacity: 0.38; }
+#aircraft-list li.very-stale .last { color: var(--red); }
 
 /* ─── DETAIL PANE ────────────────────────────────────────────────── */
 

@@ -224,6 +224,37 @@
     return ` ↓${Math.abs(Math.round(fpm))}`;
   }
 
+  // "Time since" formatter used by the LAST column and detail panes.
+  // Compact: "12s", "2m", "1h 03m".  Returns "—" when ts is null.
+  function fmtAge(secsAgo) {
+    if (secsAgo == null || !isFinite(secsAgo) || secsAgo < 0) return '—';
+    const s = Math.floor(secsAgo);
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ' + String(s % 60).padStart(2, '0') + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+  }
+
+  // Map-marker staleness thresholds (seconds since last frame).  Below
+  // STALE_S the marker renders normally; between STALE_S and VERY_STALE_S
+  // it dims; beyond VERY_STALE_S it's almost ghosted but kept on the map
+  // until the engine prunes it (currently 10 minutes).
+  const STALE_S = 60;
+  const VERY_STALE_S = 180;
+
+  function ageOf(ac) {
+    if (!ac || ac.last_seen == null) return null;
+    return (Date.now() / 1000) - ac.last_seen;
+  }
+
+  function staleLevel(age) {
+    if (age == null) return '';
+    if (age >= VERY_STALE_S) return 'very-stale';
+    if (age >= STALE_S) return 'stale';
+    return '';
+  }
+
   function aircraftIconSvg(headingDeg) {
     // A simple stylized aircraft silhouette (tip points up by default)
     return `<svg viewBox="-10 -10 20 20" xmlns="http://www.w3.org/2000/svg" style="transform: rotate(${headingDeg || 0}deg)">
@@ -308,9 +339,11 @@
   }
 
   function markerClass(ac) {
+    const stale = staleLevel(ageOf(ac));
     return 'ac-marker fl-' + flBand(ac.alt_baro_ft) +
            (ac.tcas_ra_active ? ' tcas-ra' : '') +
-           (ac.icao === state.selectedIcao ? ' selected' : '');
+           (ac.icao === state.selectedIcao ? ' selected' : '') +
+           (stale ? ' ' + stale : '');
   }
 
   function makeMarker(ac) {
@@ -408,10 +441,12 @@
       });
 
     el.list.innerHTML = items.map(ac => {
+      const age = ageOf(ac);
+      const stale = staleLevel(age);
       const cls = (ac.icao === state.selectedIcao ? 'selected ' : '') +
-                  (ac.tcas_ra_active ? 'tcas-ra' : '');
+                  (ac.tcas_ra_active ? 'tcas-ra ' : '') +
+                  stale;
       const typ = ac.info?.type_code || '—';
-      const bdsCount = (ac.bds_observed || []).length;
       // Route (origin → destination) inlined under the callsign when
       // route enrichment has resolved this callsign.
       let routeStr = '';
@@ -433,7 +468,7 @@
         <span class="typ">${typ}</span>
         <span class="fl">${fmtFL(ac.alt_baro_ft)}</span>
         <span class="gs">${fmtSpeed(ac.gs_kt)}</span>
-        <span class="bds">${bdsCount > 0 ? bdsCount : ''}</span>
+        <span class="last">${fmtAge(age)}</span>
       </li>`;
     }).join('');
 
@@ -679,6 +714,7 @@
       <div class="detail-section">
         <h4>SURVEILLANCE QUALITY</h4>
         <div class="detail-grid">
+          <div class="detail-row${staleLevel(ageOf(ac)) ? ' alert' : ''}"><span class="k">LAST SEEN</span><span class="v">${fmtAge(ageOf(ac))} ago</span>${srcTag('receiver')}</div>
           <div class="detail-row"><span class="k">RSSI</span><span class="v">${ac.rssi != null ? ac.rssi.toFixed(1) + ' dBFS' : '—'}</span>${srcTag('receiver')}</div>
           <div class="detail-row"><span class="k">ADS-B v</span><span class="v">${ac.adsb_version != null ? 'v' + ac.adsb_version : '—'}</span>${srcTag('TC=31')}</div>
           <div class="detail-row"><span class="k">NIC</span><span class="v">${fmtMaybe(ac.nic)}</span>${srcTag('TC=31')}</div>
@@ -791,7 +827,9 @@
         </div>
       </div>` : '';
 
+    const ageNow = ageOf(ac);
     const linkRows = [
+      rowAlert('LAST', fmtAge(ageNow) + ' ago', !!staleLevel(ageNow)),
       row('RSSI',   ac.rssi != null ? ac.rssi.toFixed(1) + ' dBFS' : '—'),
       row('ADS-B',  ac.adsb_version != null ? 'v' + ac.adsb_version : '—'),
       row('NIC',    fmtMaybe(ac.nic)),
@@ -1173,4 +1211,30 @@
   }
 
   connect();
+
+  // ─── Staleness ticker ───────────────────────────────────────────────
+  // No new frames are needed to *advance* the LAST column or to dim the
+  // map markers — those are derived purely from wall-clock time vs each
+  // aircraft's `last_seen`.  Re-render the list and the marker icons
+  // every 2 seconds so the UI doesn't claim a contact is "5s old" when
+  // it's actually been silent for two minutes.
+  setInterval(() => {
+    renderList();
+    if (state.selectedIcao && state.aircraft.has(state.selectedIcao)) {
+      renderDetail();
+    }
+    // Marker icons: re-icon only when the staleness tier has actually
+    // changed since the last paint — avoid pointless full rebuilds.
+    if (!markers || !markers.size) return;
+    for (const [icao, m] of markers) {
+      const ac = state.aircraft.get(icao);
+      if (!ac) continue;
+      const want = staleLevel(ageOf(ac));
+      const have = (m._sw_stale === undefined) ? null : m._sw_stale;
+      if (want !== have) {
+        m._sw_stale = want;
+        updateMarker(ac);
+      }
+    }
+  }, 2000);
 })();
