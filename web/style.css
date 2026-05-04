@@ -971,6 +971,47 @@ body::before {
 .rx-row .rx-rssi   { color: var(--cyan); font-variant-numeric: tabular-nums; }
 .rx-row .rx-frames { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
 
+/* EVENTS block in the detail pane — same global ticker, filtered to
+ * the selected aircraft.  Tighter typography than the global ticker
+ * since it sits inside the side pane and has limited width. */
+.ev-count {
+  color: var(--fg-dim);
+  font-size: 9px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0.05em;
+  margin-left: 6px;
+}
+.ev-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+.ev-list .ev-row {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  column-gap: 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  padding: 1px 0;
+  border-bottom: 1px solid rgba(120, 200, 200, 0.04);
+}
+.ev-list .ev-row:last-child { border-bottom: none; }
+.ev-list .ev-t   { color: var(--fg-dim); font-size: 9px; font-variant-numeric: tabular-nums; }
+.ev-list .ev-msg { color: var(--fg-primary); }
+.ev-list .ev-row.ev-tcas .ev-msg  { color: var(--red-bright); font-weight: 500; }
+.ev-list .ev-row.ev-emerg .ev-msg { color: var(--amber-bright); }
+.ev-list .ev-row.ev-intent .ev-msg { color: var(--cyan); }
+.ev-empty {
+  color: var(--fg-faint);
+  font-size: 10px;
+  font-style: italic;
+}
+
 /* Compact-view footer: tiny one-liner replacing the BDS-pills /
  * DF-counts sections that the VERBOSE view shows in full. */
 .detail-footer {

@@ -14,6 +14,12 @@
     selectedIcao: null,
     receiver: null,
     raEvents: [],            // {icao, started_at, ended_at, summary, threat_icao}
+    // Bounded backlog of every event the ticker has seen this session.
+    // Kept as data (not just DOM) so the per-aircraft EVENTS block in
+    // the detail pane can filter by ICAO.  Insertion-order (oldest at
+    // index 0); the renderer reverses it for newest-first display.
+    events: [],
+    eventsMax: 500,
     stats: {},
     frameTimes: [],          // sliding window for rate calc
     filterText: '',
@@ -479,6 +485,58 @@
 
   // ─── Detail pane ────────────────────────────────────────────────────
 
+  // One-line text summary of an event, for the per-aircraft EVENTS
+  // block.  The global ticker has its own renderer in `pushEvent` that
+  // also styles by class; here we keep it minimal and homogeneous so
+  // the per-aircraft block reads as a clean log.
+  function fmtAircraftEvent(ev) {
+    const t = new Date((ev.t || Date.now() / 1000) * 1000)
+      .toISOString().substr(11, 8);
+    let cls = 'ev-row';
+    let msg;
+    if (ev.type === 'new_aircraft') {
+      msg = 'CONTACT acquired';
+    } else if (ev.type === 'tcas_ra_started') {
+      cls += ' ev-tcas';
+      msg = `RA · ${ev.summary || ''}` +
+            (ev.threat_icao ? ` (vs ${ev.threat_icao})` : '');
+    } else if (ev.type === 'tcas_ra_ended') {
+      cls += ' ev-tcas';
+      msg = `RA END · ${ev.summary || ''}`;
+    } else if (ev.type === 'emergency') {
+      cls += ' ev-emerg';
+      msg = `EMERGENCY · ${ev.state || ''}`;
+    } else if (ev.type === 'intent_change') {
+      cls += ' ev-intent';
+      const src = ev.source ? ` [${ev.source}]` : '';
+      msg = `${ev.summary || ''}${src}`;
+    } else {
+      msg = ev.summary || ev.type || JSON.stringify(ev);
+    }
+    return `<div class="${cls}"><span class="ev-t">${t}</span><span class="ev-msg">${msg}</span></div>`;
+  }
+
+  // Per-aircraft event stream — filtered subset of the global ticker.
+  // Includes events naming this aircraft directly (`ev.icao`) AND ones
+  // where it appears as a TCAS threat (`ev.threat_icao`), so resolution
+  // advisories show up on both ends of the encounter.  Newest first;
+  // capped at 20 rows so the detail pane stays scannable.
+  function aircraftEventsBlock(ac) {
+    const matches = state.events.filter(ev =>
+      ev.icao === ac.icao || ev.threat_icao === ac.icao);
+    if (!matches.length) return `
+      <div class="detail-section">
+        <h4>EVENTS</h4>
+        <div class="ev-empty">No events yet for ${ac.icao}.</div>
+      </div>`;
+    const rows = matches.slice(-20).reverse().map(fmtAircraftEvent).join('');
+    return `
+      <div class="detail-section">
+        <h4>EVENTS <span class="ev-count">${matches.length}</span></h4>
+        <div class="ev-list">${rows}</div>
+      </div>`;
+  }
+
   // Renders the active flags from a {vnav, alt_hold, approach, ...}
   // dict as "VNAV / ALT_HOLD / APPROACH" — or em-dash if all are
   // false/None.  Empty string when the dict is empty.
@@ -757,6 +815,7 @@
       </div>
 
       ${receiversBlock(ac)}
+      ${aircraftEventsBlock(ac)}
     `;
   }
 
@@ -898,6 +957,7 @@
       </div>
 
       ${receiversBlock(ac)}
+      ${aircraftEventsBlock(ac)}
 
       <div class="detail-section detail-footer">
         <span class="detail-footer-item">BDS <span class="n">${bdsCount}</span></span>
@@ -981,6 +1041,21 @@
     el.eventLog.insertBefore(li, el.eventLog.firstChild);
     while (el.eventLog.children.length > 200) {
       el.eventLog.removeChild(el.eventLog.lastChild);
+    }
+    // Mirror into state.events so the per-aircraft EVENTS block in the
+    // detail pane can filter by ICAO.  Trim to the configured cap.
+    state.events.push(ev);
+    if (state.events.length > state.eventsMax) {
+      state.events.splice(0, state.events.length - state.eventsMax);
+    }
+    // If the event references the currently-selected aircraft, refresh
+    // the detail pane so the per-aircraft EVENTS section picks it up.
+    // (A normal `update` only fires on state changes; pure events
+    // wouldn't otherwise trigger a redraw.)
+    if (state.selectedIcao && (
+          ev.icao === state.selectedIcao ||
+          ev.threat_icao === state.selectedIcao)) {
+      renderDetail();
     }
   }
 
@@ -1133,6 +1208,12 @@
         source: e.source,
       }));
       renderRaTimeline();
+    }
+    // Replay any persisted ticker events so the per-aircraft EVENTS
+    // block in the detail pane has history immediately on connect,
+    // not just from this point forward.  Snapshot lists oldest-first.
+    if (Array.isArray(msg.events)) {
+      state.events = msg.events.slice(-state.eventsMax);
     }
     rerenderAll();
   }
