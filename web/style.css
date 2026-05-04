@@ -869,6 +869,16 @@ body::before {
   gap: 3px;
 }
 
+/* BDS-sourced mode line — slightly dimmer + tinted to flag that this
+ * value comes from BDS 4,0 and may disagree with the TC=29 line above
+ * (transponder firmwares often encode the two inconsistently). */
+.modes-line.modes-bds {
+  margin-top: 2px;
+  color: var(--fg-dim);
+  font-size: 9.5px;
+}
+.modes-line.modes-bds .modes-lbl { color: var(--fg-faint); }
+
 .detail-row.alert .v { color: var(--red); }
 .detail-row.amber .v { color: var(--amber); }
 

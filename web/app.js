@@ -479,6 +479,17 @@
 
   // ─── Detail pane ────────────────────────────────────────────────────
 
+  // Renders the active flags from a {vnav, alt_hold, approach, ...}
+  // dict as "VNAV / ALT_HOLD / APPROACH" — or em-dash if all are
+  // false/None.  Empty string when the dict is empty.
+  function fmtModeFlags(modes) {
+    if (!modes || !Object.keys(modes).length) return '';
+    const active = Object.entries(modes)
+      .filter(([, v]) => v)
+      .map(([k]) => k.toUpperCase());
+    return active.length ? active.join(' / ') : '—';
+  }
+
   // RECEIVERS HEARING block: which receivers have heard this aircraft,
   // with their RSSI.  Skipped entirely when only one receiver exists
   // (single-receiver mode reads RSSI from the top-level field via the
@@ -697,8 +708,14 @@
         ${ac.autopilot_modes && Object.keys(ac.autopilot_modes).length ? `
           <div class="modes-line">
             <span class="modes-lbl">Modes:</span>
-            ${Object.entries(ac.autopilot_modes).filter(([,v]) => v).map(([k]) => k.toUpperCase()).join(' / ') || '—'}
-            ${srcTag('TC=29', 'BDS 4,0')}
+            ${fmtModeFlags(ac.autopilot_modes) || '—'}
+            ${srcTag('TC=29')}
+          </div>` : ''}
+        ${ac.autopilot_modes_bds && Object.keys(ac.autopilot_modes_bds).length ? `
+          <div class="modes-line modes-bds">
+            <span class="modes-lbl">Modes (BDS):</span>
+            ${fmtModeFlags(ac.autopilot_modes_bds) || '—'}
+            ${srcTag('BDS 4,0')}
           </div>` : ''}
       </div>` : ''}
 
@@ -802,9 +819,8 @@
     ];
 
     const hasAutopilot = ac.sel_alt_mcp_ft || ac.sel_alt_fms_ft || ac.qnh_mb || ac.selected_heading_deg != null;
-    const apModes = ac.autopilot_modes
-      ? Object.entries(ac.autopilot_modes).filter(([,v]) => v).map(([k]) => k.toUpperCase())
-      : [];
+    const apModesStr = fmtModeFlags(ac.autopilot_modes);
+    const apModesBdsStr = fmtModeFlags(ac.autopilot_modes_bds);
     const apBlock = hasAutopilot ? `
       <div class="detail-section">
         <h4>AUTOPILOT INTENT</h4>
@@ -814,7 +830,8 @@
           ${row('SEL HDG', fmtHeading(ac.selected_heading_deg))}
           ${row('QNH', ac.qnh_mb != null ? ac.qnh_mb.toFixed(1) + ' mb' : '—')}
         </div>
-        ${apModes.length ? `<div class="modes-line"><span class="modes-lbl">Modes:</span> ${apModes.join(' / ')}</div>` : ''}
+        ${apModesStr ? `<div class="modes-line"><span class="modes-lbl">Modes:</span> ${apModesStr}</div>` : ''}
+        ${apModesBdsStr ? `<div class="modes-line modes-bds"><span class="modes-lbl">Modes (BDS):</span> ${apModesBdsStr}</div>` : ''}
       </div>` : '';
 
     const hasMet = ac.wind_speed_kt || ac.static_air_temp_c;
