@@ -418,6 +418,104 @@ body::before {
   stroke-dasharray: 1 4;
 }
 
+/* ─── AIRPORT MARKERS ────────────────────────────────────────────────
+ * Static-overlay layer below the aircraft layer.  Markers don't
+ * intercept clicks (interactive: false in JS) so traffic stays
+ * clickable through them. */
+.ap-marker {
+  position: absolute;
+  width: 0; height: 0;
+  pointer-events: none;
+}
+/* Airport icon styling, three tiers of "importance":
+ *   large_airport  — solid cyan filled disc (commercial hub).
+ *   medium_airport — solid amber filled disc, slightly smaller
+ *                    (regional / secondary commercial).
+ *   small_airport  — hollow amber ring (general aviation / local
+ *                    field; visually quieter so it reads as "minor"
+ *                    when many sit close together).
+ *   heliport / default — tiny grey filled dot at the base size.
+ *
+ * Each gets a 1 px black halo (box-shadow) so the icon stays visible
+ * over both bright and dark tile pixels without needing a backdrop. */
+.ap-marker .ap-icon {
+  position: absolute;
+  left: -2px; top: -2px;
+  width: 4px; height: 4px;
+  background: var(--fg-dim);
+  border-radius: 50%;
+  opacity: 0.85;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7);
+}
+.ap-marker.ap-large_airport .ap-icon {
+  background: var(--cyan);
+  width: 8px; height: 8px;
+  left: -4px; top: -4px;
+  opacity: 0.95;
+}
+.ap-marker.ap-medium_airport .ap-icon {
+  background: var(--amber);
+  width: 6px; height: 6px;
+  left: -3px; top: -3px;
+  opacity: 0.9;
+}
+.ap-marker.ap-small_airport .ap-icon {
+  /* Hollow ring — outline only, no fill — to read as "minor". */
+  background: transparent;
+  border: 1px solid var(--amber);
+  width: 5px; height: 5px;
+  left: -3px; top: -3px;
+  opacity: 0.85;
+  box-shadow: none;     /* halo would compete with the ring */
+}
+/* Airport labels.  No text-shadow on any tier — solid colours that
+ * carry their own contrast.  Per-tier brightness keeps the visual
+ * hierarchy: bright for hubs, mid for regional, dim for GA fields. */
+.ap-marker .ap-label {
+  position: absolute;
+  left: 7px; top: -6px;
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--fg-primary);
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.ap-marker.ap-large_airport .ap-label {
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+.ap-marker.ap-medium_airport .ap-label {
+  color: var(--amber-bright);
+}
+.ap-marker.ap-small_airport .ap-label {
+  color: var(--amber);
+  font-size: 8.5px;
+}
+.ap-marker.ap-heliport .ap-label,
+.ap-marker.ap-balloonport .ap-label,
+.ap-marker.ap-seaplane_base .ap-label {
+  color: var(--fg-dim);
+  font-size: 8.5px;
+}
+/* The airport NAME line (city/airport, smaller than the ICAO above it). */
+.ap-marker .ap-label .ap-name {
+  display: block;
+  color: var(--fg-primary);
+  font-size: 8.5px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+.ap-marker.ap-large_airport .ap-label .ap-name { color: var(--fg-bright); }
+.ap-marker.ap-medium_airport .ap-label .ap-name { color: var(--amber-bright); }
+.ap-marker.ap-small_airport .ap-label .ap-name { color: var(--amber); }
+
+/* Runway polygons — drawn at zoom >= 10 only.  Subtle phosphor green
+ * fill matched to the existing colour palette. */
+.rw-poly {
+  pointer-events: none;
+}
+
 /* Map overlay panels */
 .overlay {
   position: absolute;

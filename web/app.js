@@ -31,6 +31,12 @@
     labelFields: new Set(JSON.parse(
       localStorage.getItem('skywatch.labelFields') ||
       '["callsign","fl","vrate","gs"]')),
+    // Airport / runway dataset (OurAirports).  Loaded once on connect;
+    // the bundled seed has ~60 hubs.  Run `python -m skywatch.airports.fetch`
+    // for the canonical full dataset.
+    airports: [],
+    runways: [],
+    airportsOn: localStorage.getItem('skywatch.airports') !== '0',
   };
 
   // ─── DOM ────────────────────────────────────────────────────────────
@@ -191,6 +197,12 @@
   const trailLayer = L.layerGroup().addTo(map);
   const tcasLinkLayer = L.layerGroup().addTo(map);
   const rangeRingLayer = L.layerGroup().addTo(map);
+  // Airport markers and runway polygons sit BELOW the aircraft layer
+  // so a marker never occludes traffic; we add them to the map last,
+  // but Leaflet z-orders by addition order.  The CSS z-index below
+  // makes that explicit.
+  const airportLayer = L.layerGroup();
+  const runwayLayer = L.layerGroup();
 
   // Per-aircraft Leaflet objects we keep around
   const markers = new Map();   // icao -> L.Marker
@@ -1307,6 +1319,258 @@
       }
     };
   }
+
+  // ─── Airport + runway dataset (OurAirports) ─────────────────────────
+  // Loaded once on page load.  The frontend prefers the canonical full
+  // dataset (`airports.csv.gz`) and falls back to the bundled seed
+  // (`airports.seed.csv.gz`) if it isn't present.  Same for runways.
+
+  // Airports + runways toggle.  Wired here (rather than alongside the
+  // other top-of-IIFE toggles) because it touches `airportLayer` and
+  // `runwayLayer`, which are only declared after the map is built.
+  const airportsToggle = document.getElementById('airports-toggle');
+  function applyAirportsToggle() {
+    airportsToggle.classList.toggle('on', state.airportsOn);
+    airportsToggle.querySelector('.val').textContent =
+      state.airportsOn ? 'ON' : 'OFF';
+    if (state.airportsOn) {
+      airportLayer.addTo(map);
+      runwayLayer.addTo(map);
+    } else {
+      airportLayer.remove();
+      runwayLayer.remove();
+    }
+  }
+  airportsToggle.addEventListener('click', () => {
+    state.airportsOn = !state.airportsOn;
+    localStorage.setItem('skywatch.airports', state.airportsOn ? '1' : '0');
+    applyAirportsToggle();
+    redrawAirports();
+    redrawRunways();
+  });
+  applyAirportsToggle();
+
+  function parseCsvLine(line) {
+    // Minimal RFC-4180 line parser: respects "..." quoting and "" as
+    // an escaped quote inside a field.  No multi-line fields supported
+    // (the OurAirports source doesn't use them).
+    const out = [];
+    let cur = '';
+    let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQ) {
+        if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (c === '"') inQ = false;
+        else cur += c;
+      } else {
+        if (c === ',') { out.push(cur); cur = ''; }
+        else if (c === '"') inQ = true;
+        else cur += c;
+      }
+    }
+    out.push(cur);
+    return out;
+  }
+
+  async function fetchGzCsv(url) {
+    const r = await fetch(url, { cache: 'force-cache' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    // Browser-native gzip decoder — supported in every modern engine.
+    const ds = new DecompressionStream('gzip');
+    const decoded = await new Response(r.body.pipeThrough(ds)).text();
+    return decoded;
+  }
+
+  function parseCsv(text) {
+    // Strip trailing newlines, split, drop empty.
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    if (lines.length < 1) return { header: [], rows: [] };
+    const header = parseCsvLine(lines[0]);
+    const idxOf = {};
+    header.forEach((h, i) => { idxOf[h] = i; });
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      rows.push(parseCsvLine(lines[i]));
+    }
+    return { header, rows, idxOf };
+  }
+
+  function num(s) {
+    if (s === '' || s == null) return null;
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function loadAirportsCsv(text) {
+    const { idxOf, rows } = parseCsv(text);
+    const I_IDENT = idxOf.ident, I_TYPE = idxOf.type, I_NAME = idxOf.name;
+    const I_LAT = idxOf.latitude_deg, I_LON = idxOf.longitude_deg;
+    const I_IATA = idxOf.iata_code, I_MUN = idxOf.municipality;
+    const out = [];
+    for (const r of rows) {
+      const lat = num(r[I_LAT]), lon = num(r[I_LON]);
+      if (lat == null || lon == null) continue;
+      const type = r[I_TYPE] || '';
+      // Drop closed airports — they clutter the map and aren't useful.
+      if (type === 'closed') continue;
+      out.push({
+        ident: r[I_IDENT] || '',
+        type,
+        name: r[I_NAME] || '',
+        lat, lon,
+        iata: r[I_IATA] || '',
+        municipality: r[I_MUN] || '',
+      });
+    }
+    return out;
+  }
+
+  function loadRunwaysCsv(text) {
+    const { idxOf, rows } = parseCsv(text);
+    const I_AID = idxOf.airport_ident;
+    const I_LEN = idxOf.length_ft, I_WID = idxOf.width_ft;
+    const I_CLOSED = idxOf.closed;
+    const I_LE_LAT = idxOf.le_latitude_deg, I_LE_LON = idxOf.le_longitude_deg;
+    const I_HE_LAT = idxOf.he_latitude_deg, I_HE_LON = idxOf.he_longitude_deg;
+    const I_LE_ID = idxOf.le_ident, I_HE_ID = idxOf.he_ident;
+    const out = [];
+    for (const r of rows) {
+      // Skip rows missing both threshold positions.  Without them we
+      // can't draw a polygon.
+      const leLat = num(r[I_LE_LAT]), leLon = num(r[I_LE_LON]);
+      const heLat = num(r[I_HE_LAT]), heLon = num(r[I_HE_LON]);
+      if (leLat == null || heLat == null) continue;
+      out.push({
+        airport_ident: r[I_AID] || '',
+        length_ft: num(r[I_LEN]),
+        width_ft: num(r[I_WID]) || 150,
+        closed: r[I_CLOSED] === '1',
+        le_ident: r[I_LE_ID] || '',
+        he_ident: r[I_HE_ID] || '',
+        le_lat: leLat, le_lon: leLon,
+        he_lat: heLat, he_lon: heLon,
+      });
+    }
+    return out;
+  }
+
+  async function loadDataset(primary, fallback, parser) {
+    // Try the full dataset first; fall back to the seed.
+    for (const url of [primary, fallback]) {
+      try {
+        const text = await fetchGzCsv(url);
+        return parser(text);
+      } catch (e) {
+        console.debug('skywatch: dataset load failed for', url, e);
+      }
+    }
+    return [];
+  }
+
+  // Zoom thresholds — chosen so the map doesn't drown in airport icons
+  // until the user is actually looking at a country/region scale.
+  function airportZoomMin(type) {
+    if (type === 'large_airport')   return 6;
+    if (type === 'medium_airport')  return 8;
+    if (type === 'small_airport')   return 10;
+    return 12;   // heliport, balloonport, seaplane_base
+  }
+
+  function airportLabelHtml(ap, zoom) {
+    if (zoom >= 11 && ap.name) {
+      return `<div class="ap-label">${ap.iata || ap.ident}<br><span class="ap-name">${ap.name}</span></div>`;
+    }
+    if (zoom >= 8) {
+      return `<div class="ap-label">${ap.iata || ap.ident}</div>`;
+    }
+    return '';
+  }
+
+  function redrawAirports() {
+    airportLayer.clearLayers();
+    if (!state.airportsOn || !state.airports.length) return;
+    const zoom = map.getZoom();
+    const bounds = map.getBounds().pad(0.1);
+    for (const ap of state.airports) {
+      if (zoom < airportZoomMin(ap.type)) continue;
+      if (!bounds.contains([ap.lat, ap.lon])) continue;
+      const icon = L.divIcon({
+        html: `<div class="ap-icon"></div>${airportLabelHtml(ap, zoom)}`,
+        className: 'ap-marker ap-' + ap.type,
+        iconSize: [0, 0],
+        iconAnchor: [0, 0],
+      });
+      L.marker([ap.lat, ap.lon], {
+        icon, interactive: false, keyboard: false,
+      }).addTo(airportLayer);
+    }
+  }
+
+  function makeRunwayPolygon(rw) {
+    // Distance-correct projection: convert lat/lon offsets to metres,
+    // build the centerline, then offset by half-width perpendicular.
+    const meanLat = (rw.le_lat + rw.he_lat) / 2;
+    const cosLat = Math.cos(meanLat * Math.PI / 180);
+    const dLatM = (rw.he_lat - rw.le_lat) * 111320;
+    const dLonM = (rw.he_lon - rw.le_lon) * 111320 * cosLat;
+    const lenM = Math.sqrt(dLatM * dLatM + dLonM * dLonM);
+    if (lenM < 1) return null;
+    // Right-hand perpendicular unit vector (in metres).
+    const halfW = (rw.width_ft || 150) * 0.3048 / 2;
+    const perpLatM = -dLonM / lenM * halfW;
+    const perpLonM =  dLatM / lenM * halfW;
+    const perpLat = perpLatM / 111320;
+    const perpLon = perpLonM / (111320 * cosLat);
+    const pts = [
+      [rw.le_lat + perpLat, rw.le_lon + perpLon],
+      [rw.he_lat + perpLat, rw.he_lon + perpLon],
+      [rw.he_lat - perpLat, rw.he_lon - perpLon],
+      [rw.le_lat - perpLat, rw.le_lon - perpLon],
+    ];
+    return L.polygon(pts, {
+      className: 'rw-poly',
+      color: '#79ddc1',
+      weight: 1,
+      opacity: 0.45,
+      fillColor: '#79ddc1',
+      fillOpacity: 0.18,
+      interactive: false,
+    });
+  }
+
+  function redrawRunways() {
+    runwayLayer.clearLayers();
+    if (!state.airportsOn || !state.runways.length) return;
+    const zoom = map.getZoom();
+    if (zoom < 10) return;          // not worth drawing at this scale
+    const bounds = map.getBounds().pad(0.05);
+    for (const rw of state.runways) {
+      if (rw.closed) continue;
+      if (!bounds.contains([rw.le_lat, rw.le_lon]) &&
+          !bounds.contains([rw.he_lat, rw.he_lon])) continue;
+      const poly = makeRunwayPolygon(rw);
+      if (poly) runwayLayer.addLayer(poly);
+    }
+  }
+
+  // Reuse one redraw on every pan/zoom — both layers are cheap to clear.
+  map.on('zoomend moveend', () => { redrawAirports(); redrawRunways(); });
+
+  (async () => {
+    state.airports = await loadDataset(
+      '/data/airports.csv.gz',
+      '/data/airports.seed.csv.gz',
+      loadAirportsCsv);
+    state.runways = await loadDataset(
+      '/data/runways.csv.gz',
+      '/data/runways.seed.csv.gz',
+      loadRunwaysCsv);
+    console.info(`skywatch: loaded ${state.airports.length} airports, `
+                 + `${state.runways.length} runways`);
+    redrawAirports();
+    redrawRunways();
+  })();
 
   connect();
 
