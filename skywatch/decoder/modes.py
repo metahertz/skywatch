@@ -107,17 +107,28 @@ def flight_status(msg: str) -> dict | None:
 class BDS40:
     """Selected vertical intention.
 
-    Note: the spec also defines VNAV / ALT_HOLD / APPROACH mode flags at
-    MB bits 49-51, but in practice many transponder firmwares encode
-    those bits inconsistently with TC=29 (ADS-B v2's "target state and
-    status").  ADS-B v2 introduced TC=29 specifically to replace the
-    BDS 4,0 mode flags, so we ignore them here and treat TC=29 as the
-    sole source of truth for autopilot mode state.
+    The spec defines VNAV / ALT_HOLD / APPROACH mode flags at MB bits
+    49-51.  In practice many transponder firmwares encode those bits
+    inconsistently with TC=29 (ADS-B v2's "target state and status"),
+    which is why TC=29 is the **sole source of truth** for the
+    `Aircraft.autopilot_modes` dict and for autopilot intent-change
+    events.
+
+    The BDS-derived mode flags are still surfaced (here, and via the
+    separate `Aircraft.autopilot_modes_bds` field) so the operator can
+    eyeball them alongside TC=29 in the UI: when the two disagree on a
+    given aircraft it's diagnostic information about that transponder's
+    firmware quirks.  Crucially, BDS-flag changes do NOT generate
+    intent-change events — only TC=29 does.
     """
     mcp_alt_ft: int | None
     fms_alt_ft: int | None
     qnh_mb: float | None
     target_alt_source: int | None  # 0/1/2/3 per spec
+    # Mode flags from BDS 4,0 — display-only, see class docstring.
+    vnav_mode: bool | None = None
+    alt_hold_mode: bool | None = None
+    approach_mode: bool | None = None
 
 
 @dataclass
@@ -189,9 +200,16 @@ def decode_bds_40(msg: str) -> BDS40 | None:
     fms_raw = get_bits(msg, 47, 12) * 16 if s_fms else None
     s_baro = get_bit(msg, 59)
     qnh = (get_bits(msg, 60, 12) * 0.1) + 800 if s_baro else None
-    # Mode flag region (msg bits 80-83) is parsed only for the reserved-bits
-    # validator below; the values themselves are intentionally not exposed.
-    # See class docstring for why.
+    # Mode-flag region (msg bits 80-83).  We surface these for display
+    # alongside TC=29 in the UI, but they are NOT used for autopilot
+    # intent-change events — see BDS40 class docstring for the why.
+    s_mode = get_bit(msg, 80)
+    if s_mode:
+        vnav = bool(get_bit(msg, 81))
+        alt_hold = bool(get_bit(msg, 82))
+        approach = bool(get_bit(msg, 83))
+    else:
+        vnav = alt_hold = approach = None
     s_src = get_bit(msg, 86)
     src = get_bits(msg, 87, 2) if s_src else None
 
@@ -238,7 +256,11 @@ def decode_bds_40(msg: str) -> BDS40 | None:
     if reserved_72_79 != 0 or reserved_84_85 != 0:
         return None
 
-    return BDS40(mcp, fms, qnh, src)
+    return BDS40(
+        mcp_alt_ft=mcp, fms_alt_ft=fms, qnh_mb=qnh,
+        target_alt_source=src,
+        vnav_mode=vnav, alt_hold_mode=alt_hold, approach_mode=approach,
+    )
 
 
 def decode_bds_50(msg: str) -> BDS50 | None:

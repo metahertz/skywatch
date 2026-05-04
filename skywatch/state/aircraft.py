@@ -93,7 +93,13 @@ class Aircraft:
     sel_alt_mcp_ft: int | None = None
     sel_alt_fms_ft: int | None = None
     qnh_mb: float | None = None
+    # `autopilot_modes` is the authoritative TC=29-sourced view used by
+    # intent-change events and the primary "Modes:" UI line.
     autopilot_modes: dict = field(default_factory=dict)
+    # `autopilot_modes_bds` is the (often divergent) BDS 4,0 view —
+    # display-only, never feeds intent-change events.  Surfaced so the
+    # operator can compare both readings side-by-side.
+    autopilot_modes_bds: dict = field(default_factory=dict)
     selected_heading_deg: float | None = None
 
     # Surveillance state
@@ -276,6 +282,7 @@ class Aircraft:
             "sel_alt_fms_ft": self.sel_alt_fms_ft,
             "qnh_mb": self.qnh_mb,
             "autopilot_modes": self.autopilot_modes,
+            "autopilot_modes_bds": self.autopilot_modes_bds,
             "selected_heading_deg": self.selected_heading_deg,
             "on_ground": self.on_ground,
             "flight_status": self.flight_status,

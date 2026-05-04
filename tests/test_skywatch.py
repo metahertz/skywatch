@@ -395,6 +395,64 @@ class TestIntentChangeEvents(unittest.TestCase):
         self.assertGreaterEqual(len(qnh_changes), 1,
             f"expected ≥1 QNH transition, got {len(qnh_changes)}")
 
+    def test_bds_modes_surface_separately_no_intent_event(self):
+        """BDS 4,0 mode flags must populate `autopilot_modes_bds` for
+        UI display, but they must NOT generate intent_change ap_mode
+        events (TC=29 is the sole source of mode-flap events to avoid
+        the cross-source disagreement spam)."""
+        from skywatch.decoder.synthetic import (
+            make_bds40, make_df11_squitter,
+        )
+        from skywatch.decoder.beast import encode_beast
+        engine, parser = self._setup_engine()
+        # Roster the aircraft via a DF11 squitter.
+        for f in parser.feed(encode_beast(make_df11_squitter("ABC123"), 0.0)):
+            engine.feed(f)
+        # First BDS 4,0 with mode flags set.  Should populate
+        # autopilot_modes_bds, leave autopilot_modes empty (TC=29 is
+        # the only writer of that), and not log a mode-flag intent
+        # event.  A first-ever sel_alt event IS expected (BDS40 is
+        # authoritative for that).
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 24000, 24000, 1013.2, alt_ft=20000,
+                       vnav_mode=True, alt_hold_mode=False,
+                       approach_mode=True),
+            1.0)):
+            engine.feed(f)
+        ac = engine.aircraft["ABC123"]
+        self.assertEqual(
+            ac.autopilot_modes_bds,
+            {"vnav": True, "alt_hold": False, "approach": True},
+        )
+        self.assertEqual(ac.autopilot_modes, {},
+            "TC=29 has not been seen yet, so autopilot_modes must stay empty")
+        # Flip the BDS flags on a subsequent frame; still no mode-flag
+        # intent events should be generated.
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 24000, 24000, 1013.2, alt_ft=20000,
+                       vnav_mode=False, alt_hold_mode=True,
+                       approach_mode=False),
+            2.0)):
+            engine.feed(f)
+        for f in parser.feed(encode_beast(
+            make_bds40("ABC123", 24000, 24000, 1013.2, alt_ft=20000,
+                       vnav_mode=False, alt_hold_mode=True,
+                       approach_mode=False),
+            3.0)):
+            engine.feed(f)
+        ap_mode_events = [e for e in engine.events
+                          if e.get("type") == "intent_change"
+                          and e.get("subtype") == "ap_mode"]
+        self.assertEqual(ap_mode_events, [],
+            f"BDS-flag flips must not fire ap_mode events; got: "
+            f"{ap_mode_events}")
+        # And the latest BDS view is reflected in to_dict for the UI.
+        d = ac.to_dict()
+        self.assertEqual(
+            d["autopilot_modes_bds"],
+            {"vnav": False, "alt_hold": True, "approach": False},
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Full pipeline integration

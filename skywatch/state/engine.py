@@ -544,10 +544,14 @@ class StateEngine:
                 ac.callsign = d
                 self._refresh_info(ac)
         elif winner.bds_code == "4,0" and isinstance(d, ms.BDS40):
-            # BDS 4,0 carries selected altitudes + QNH; we deliberately do
-            # NOT consume its mode-flag bits because real-world transponder
-            # firmwares encode them inconsistently with TC=29.  TC=29 is the
-            # sole source of truth for autopilot modes.
+            # BDS 4,0 carries selected altitudes + QNH (used as data) and
+            # autopilot mode flags (display-only, see notes).  TC=29 stays
+            # the sole source of truth for `ac.autopilot_modes` and for
+            # autopilot intent-change events; the BDS view goes into the
+            # parallel `autopilot_modes_bds` field so the UI can show
+            # both side-by-side.  Real transponder firmwares often
+            # disagree between the two — that disagreement itself is
+            # diagnostic, hence we surface it.
             pre = self._snapshot_intent(ac)
             if d.mcp_alt_ft is not None:
                 ac.sel_alt_mcp_ft = d.mcp_alt_ft
@@ -555,8 +559,18 @@ class StateEngine:
                 ac.sel_alt_fms_ft = d.fms_alt_ft
             if d.qnh_mb is not None:
                 ac.qnh_mb = d.qnh_mb
+            if (d.vnav_mode is not None or d.alt_hold_mode is not None
+                    or d.approach_mode is not None):
+                ac.autopilot_modes_bds = {
+                    "vnav": d.vnav_mode,
+                    "alt_hold": d.alt_hold_mode,
+                    "approach": d.approach_mode,
+                }
             self._trace_modes(ac, msg, "BDS40", {
-                "modes": "ignored (TC=29 is source of truth)",
+                "vnav": d.vnav_mode,
+                "alt_hold": d.alt_hold_mode,
+                "approach": d.approach_mode,
+                "note": "display-only; TC=29 drives intent events",
             }, extra={
                 "candidates": [(c.bds_code, c.confidence) for c in candidates],
                 "mcp": d.mcp_alt_ft, "fms": d.fms_alt_ft, "qnh": d.qnh_mb,

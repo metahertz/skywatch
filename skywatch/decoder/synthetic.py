@@ -290,8 +290,17 @@ def make_bds60(
 def make_bds40(
     icao: str, mcp_alt_ft: int, fms_alt_ft: int, qnh_mb: float,
     alt_ft: int = 30000,
+    vnav_mode: bool | None = None,
+    alt_hold_mode: bool | None = None,
+    approach_mode: bool | None = None,
 ) -> str:
-    """DF20 reply carrying BDS 4,0 (selected vertical intention)."""
+    """DF20 reply carrying BDS 4,0 (selected vertical intention).
+
+    The three mode-flag args are optional.  If any one is non-None the
+    mode-status bit (MB:48) is set and the three flag bits encode the
+    given booleans (None → False).  When all three are None we leave
+    mode-status off, matching the historical default.
+    """
     df = format(20, "05b")
     fs = format(0, "03b")
     dr = "00000"
@@ -307,8 +316,14 @@ def make_bds40(
     s_qnh = "1"
     qnh_bits = format(int(round((qnh_mb - 800) / 0.1)), "012b")
     reserved = "00000000"
-    s_mode = "0"
-    vnav = alt_hold = approach = "0"
+    if vnav_mode is None and alt_hold_mode is None and approach_mode is None:
+        s_mode = "0"
+        vnav = alt_hold = approach = "0"
+    else:
+        s_mode = "1"
+        vnav = "1" if vnav_mode else "0"
+        alt_hold = "1" if alt_hold_mode else "0"
+        approach = "1" if approach_mode else "0"
     reserved2 = "00"
     s_src = "0"
     src = "00"
