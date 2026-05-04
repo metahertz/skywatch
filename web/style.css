@@ -245,7 +245,13 @@ body::before {
   font-family: var(--font-mono) !important;
 }
 
-.leaflet-tile-pane { filter: invert(0.92) hue-rotate(170deg) saturate(0.5) brightness(0.7); }
+/* Basemap colour grade.  We invert the OSM/CARTO light tiles into a
+ * dark-mode look (keeps the "outline" feel of vector lines), then nudge
+ * contrast + brightness so coastlines, roads, and runways read clearly
+ * rather than muddy out into a single tone. */
+.leaflet-tile-pane {
+  filter: invert(0.95) hue-rotate(180deg) saturate(0.55) brightness(0.92) contrast(1.05);
+}
 
 .leaflet-control-attribution {
   background: rgba(11, 17, 19, 0.85) !important;
@@ -356,16 +362,18 @@ body::before {
   position: absolute;
   left: 12px;
   top: -8px;
-  font-size: 9.5px;
+  font-size: 10px;
   font-weight: 500;
   white-space: nowrap;
   color: var(--fg-bright);
+  /* Soft dark halo behind the text — preserves antialiasing (the old
+   * 4-direction 1px shadow was pixel-shifted into the glyphs).  Three
+   * stops give complete separation from any tile colour. */
   text-shadow:
-    1px 0 0 var(--bg-deep),
-    -1px 0 0 var(--bg-deep),
-    0 1px 0 var(--bg-deep),
-    0 -1px 0 var(--bg-deep);
-  line-height: 1.1;
+    0 0 3px rgba(0, 0, 0, 0.95),
+    0 0 6px rgba(0, 0, 0, 0.75),
+    1px 1px 0 rgba(0, 0, 0, 0.85);
+  line-height: 1.15;
   pointer-events: none;
 }
 
@@ -374,11 +382,24 @@ body::before {
 .ac-label .lbl-typ { color: var(--fg-primary); font-size: 9px; }
 .ac-label .lbl-alt { color: var(--cyan); }
 .ac-label .lbl-spd { color: var(--fg-primary); }
-.ac-label .lbl-vrate { color: var(--fg-dim); margin-left: 2px; }
-.ac-label .lbl-hdg { color: var(--fg-dim); margin-left: 4px; }
+/* V/S and HDG: render WITHOUT the parent's halo shadow (the dim
+ * source colour + halo combination came out smeared/unreadable).
+ * Solid phosphor green on its own gives enough contrast against
+ * the dark basemap; turning the shadow off keeps the antialiasing
+ * crisp at small sizes. */
+.ac-label .lbl-vrate {
+  color: var(--fg-primary);
+  text-shadow: none;
+  margin-left: 2px;
+}
+.ac-label .lbl-hdg {
+  color: var(--fg-primary);
+  text-shadow: none;
+  margin-left: 4px;
+}
 .ac-label .lbl-sqk { color: var(--amber); margin-left: 4px; font-size: 9px; }
 .ac-label .lbl-route { color: var(--amber-bright); font-size: 9px; }
-.ac-label .lbl-rx { color: var(--fg-faint); font-size: 8.5px; letter-spacing: 0.05em; }
+.ac-label .lbl-rx { color: var(--fg-dim); font-size: 8.5px; letter-spacing: 0.05em; }
 
 /* Trail */
 .ac-trail {
@@ -413,9 +434,10 @@ body::before {
 /* Range ring */
 .range-ring {
   fill: none;
-  stroke: var(--fg-faint);
+  stroke: var(--fg-dim);
   stroke-width: 1;
-  stroke-dasharray: 1 4;
+  stroke-dasharray: 2 4;
+  opacity: 0.6;
 }
 
 /* ─── AIRPORT MARKERS ────────────────────────────────────────────────
@@ -469,8 +491,10 @@ body::before {
   box-shadow: none;     /* halo would compete with the ring */
 }
 /* Airport labels.  No text-shadow on any tier — solid colours that
- * carry their own contrast.  Per-tier brightness keeps the visual
- * hierarchy: bright for hubs, mid for regional, dim for GA fields. */
+ * carry their own contrast.  The previous halo was smearing the
+ * smaller name/secondary lines.  Per-tier brightness keeps the
+ * visual hierarchy: bright for hubs, mid for regional, dim for
+ * GA fields. */
 .ap-marker .ap-label {
   position: absolute;
   left: 7px; top: -6px;
