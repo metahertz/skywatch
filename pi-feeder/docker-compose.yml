@@ -30,14 +30,22 @@ services:
     ports:
       - "8090:8090"
     volumes:
-      # Bind-mount the project root so the manager can read/write
-      # the .env file and run `docker compose` against the sibling
-      # services on the host.
-      - ${PI_FEEDER_DIR:-..}:/srv/pi-feeder
+      # Bind-mount the project ROOT at /srv inside the container.
+      # The compose file the manager reads — and the build contexts
+      # the compose `build:` directives need (skywatch.Dockerfile's
+      # context is the project root, dumpvdl2's is ../docker/dumpvdl2)
+      # — all live above pi-feeder/, so we need the whole tree.  The
+      # host-side default `..` resolves to the project root when this
+      # compose is invoked from pi-feeder/, which install.sh does.
+      # Inside the container, the pi-feeder dir lives at /srv/pi-feeder
+      # — same shape as the host, so paths are self-describing.
+      - ${PI_FEEDER_DIR:-..}:/srv
       # Talk to host docker — the manager invokes `docker compose
       # up -d` after writing the .env.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      # Manager looks here for docker-compose.yml + .env.  Matches the
+      # path layout inside /srv after the bind-mount above.
       PI_FEEDER_DIR: /srv/pi-feeder
 
   # ─── SDR core: dump1090-fa + readsb + tar1090 + graphs1090 ──────

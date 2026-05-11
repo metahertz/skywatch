@@ -115,7 +115,27 @@ for them when you tick the box):
 
 * `SKYWATCH_EDGE_NAME`    — stable site id (e.g. hostname).
 * `SKYWATCH_CENTRAL_URL`  — `ws://central.lan:8767/ingest`.
-* `SKYWATCH_INGEST_TOKEN` — bearer token issued by the central.
+* `SKYWATCH_INGEST_TOKEN` — bearer token; mint one with the helper
+  below.
+
+### Generating an ingest token
+
+Tokens are just shared secrets — there is no central authority
+issuing them.  Mint one on the central host:
+
+```bash
+python -m skywatch.central gen-token
+# → e.g. nbqlj9zNxYM-rZw4uTHe9d8sjJ2cFkR-W3Z1lQc8YfA
+```
+
+Paste the same value into `SKYWATCH_INGEST_TOKEN` on the central
+(its own env file) and on every edge (via the manager UI's secret
+field).  How it's used: the edge sends `{"type":"hello","token":...}`
+as its first WS frame after connect; the central checks it with
+`hmac.compare_digest` and closes the socket on mismatch.  Tokens
+travel in cleartext over the plain `ws://` channel — keep ingest on
+a trusted LAN or terminate TLS at a reverse proxy in front of the
+central's `--ingest-bind` port.
 
 ## Manager UI
 

@@ -1265,6 +1265,29 @@ class TestPiFeederComposeSkywatchCommand(unittest.TestCase):
         self.assertIn("--vdl2 vdl2:5555", block)
         self.assertIn("--vdl2-name vdl2", block)
 
+    def test_central_gen_token_subcommand(self):
+        """`python -m skywatch.central gen-token` prints one URL-safe
+        random string and exits 0; two invocations must differ."""
+        import io
+        import contextlib
+        from skywatch.central import __main__ as central_main
+        outs = []
+        for _ in range(2):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = central_main.main(["gen-token"])
+            self.assertEqual(rc, 0)
+            tok = buf.getvalue().strip()
+            # secrets.token_urlsafe(32) ≈ 43 chars; require ≥ 40 to
+            # tolerate trimming or a future entropy bump.
+            self.assertGreaterEqual(len(tok), 40)
+            # URL-safe base64 alphabet only.
+            self.assertTrue(all(c.isalnum() or c in "-_" for c in tok),
+                            f"non-urlsafe char in token: {tok!r}")
+            outs.append(tok)
+        self.assertNotEqual(outs[0], outs[1],
+                            "gen-token must produce fresh entropy each call")
+
     def test_skywatch_edge_service_present(self):
         """Edge-mode profile exists and runs skywatch.edge with the
         wiring documented in .env.example (name, central URL, token)."""

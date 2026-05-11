@@ -5,9 +5,16 @@ Lower latency than the Mongo change-stream transport (~10-50 ms LAN),
 no Mongo dependency on the wire path, but no built-in durability —
 when central is unreachable the edge spool is the only safety net.
 
-Auth: a shared bearer token in the `Authorization` header at WS
-upgrade.  Operators provide the token via the `--token-env VARNAME`
-flag at both ends; mismatched tokens close the connection at 1008.
+Auth: a shared bearer token, optional.  Edges send it twice — once in
+an `Authorization: Bearer …` header on the WS upgrade (cosmetic; the
+stock WebSocketServer doesn't surface request headers to application
+code) and once as the *first* WS text frame after the upgrade:
+`{"type": "hello", "token": "..."}`.  The application-layer hello is
+what the central actually validates.  Mismatch closes the socket from
+the server side.  When no token is configured anywhere, every
+inbound connection auto-authenticates — fine on a trusted LAN, not
+fine on a public path.  Generate a token with
+`python -m skywatch.central gen-token`.
 
 Both directions share the existing `skywatch.server.websocket` codebase
 where possible — the inbound server *is* a stock `WebSocketServer` with
@@ -18,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -273,8 +281,14 @@ class WebSocketPushTransport(Transport):
         except json.JSONDecodeError:
             return
         # Handle the auth handshake first (when a token is configured).
+        # `hmac.compare_digest` over `==` to keep timing-attack
+        # resistance if anyone ever puts TLS in front of this; both
+        # operands are coerced to str so a missing/null `token` field
+        # on the wire doesn't raise.
         if not getattr(client, "_sw_authed", True):
-            if doc.get("type") == "hello" and doc.get("token") == self.token:
+            supplied = str(doc.get("token") or "")
+            if (doc.get("type") == "hello"
+                    and hmac.compare_digest(supplied, self.token or "")):
                 client._sw_authed = True
                 return
             try:

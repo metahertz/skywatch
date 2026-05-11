@@ -47,6 +47,19 @@ def _parse_endpoint(endpoint: str, default_port: int) -> tuple[str, int]:
 
 
 def main(argv=None) -> int:
+    # Tiny subcommand dispatch: keep the flat-flag CLI for the run
+    # path, peel off operator helpers as positional commands.  argv
+    # defaults to sys.argv[1:] so the same sniff works whether
+    # invoked from the CLI or programmatically (tests).
+    effective_argv = argv if argv is not None else sys.argv[1:]
+    if effective_argv and effective_argv[0] == "gen-token":
+        import secrets
+        # 32 bytes → ~43 url-safe chars, 256 bits of entropy.  Paste
+        # the output into SKYWATCH_INGEST_TOKEN on the central host
+        # and every edge.
+        print(secrets.token_urlsafe(32))
+        return 0
+
     parser = argparse.ArgumentParser(
         prog="skywatch.central",
         description="Central renderer: consume deltas, merge, serve UI.",
