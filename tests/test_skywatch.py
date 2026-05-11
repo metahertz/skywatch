@@ -1246,24 +1246,34 @@ class TestCentralMergerComms(unittest.TestCase):
 class TestPiFeederComposeSkywatchCommand(unittest.TestCase):
     """The pi-feeder skywatch service must invoke `--vdl2` so the
     docker stack populates the comms collection without operator
-    intervention.  Pure text scan — avoids a yaml dep in tests."""
+    intervention.  YAML-aware checks — the `command:` blocks are
+    list-form (one arg per element) so YAML can't fold newlines
+    mid-command; substring scans don't work."""
 
-    def test_skywatch_command_includes_vdl2(self):
+    @staticmethod
+    def _load_compose():
         import os as _os
+        import yaml as _yaml
         compose_path = _os.path.join(
             _os.path.dirname(__file__), "..", "pi-feeder", "docker-compose.yml")
         with open(compose_path) as f:
-            text = f.read()
-        # Find the skywatch service block (between `  skywatch:` and
-        # the next top-level service, whichever comes first).
-        start = text.find("\n  skywatch:\n")
-        self.assertGreater(start, 0)
-        # Next sibling service starts with two-space indent + name.
-        end = text.find("\n  skywatch-edge:\n", start)
-        self.assertGreater(end, start)
-        block = text[start:end]
-        self.assertIn("--vdl2 vdl2:5555", block)
-        self.assertIn("--vdl2-name vdl2", block)
+            return _yaml.safe_load(f)
+
+    @staticmethod
+    def _flag_value(args, flag):
+        """Return the value following `flag` in an arg list, or None."""
+        try:
+            i = args.index(flag)
+        except ValueError:
+            return None
+        return args[i + 1] if i + 1 < len(args) else None
+
+    def test_skywatch_command_includes_vdl2(self):
+        svc = self._load_compose()["services"]["skywatch"]
+        cmd = svc["command"]
+        self.assertIsInstance(cmd, list, "command must be list-form")
+        self.assertEqual(self._flag_value(cmd, "--vdl2"), "vdl2:5555")
+        self.assertEqual(self._flag_value(cmd, "--vdl2-name"), "vdl2")
 
     def test_central_gen_token_subcommand(self):
         """`python -m skywatch.central gen-token` prints one URL-safe
@@ -1291,26 +1301,39 @@ class TestPiFeederComposeSkywatchCommand(unittest.TestCase):
     def test_skywatch_edge_service_present(self):
         """Edge-mode profile exists and runs skywatch.edge with the
         wiring documented in .env.example (name, central URL, token)."""
-        import os as _os
-        compose_path = _os.path.join(
-            _os.path.dirname(__file__), "..", "pi-feeder", "docker-compose.yml")
-        with open(compose_path) as f:
-            text = f.read()
-        start = text.find("\n  skywatch-edge:\n")
-        self.assertGreater(start, 0, "skywatch-edge service missing")
-        end = text.find("\n  vdl2:\n", start)
-        self.assertGreater(end, start)
-        block = text[start:end]
-        self.assertIn('profiles: ["skywatch-edge"]', block)
-        self.assertIn("python3 -m skywatch.edge", block)
-        self.assertIn("--beast ultrafeeder:30005", block)
-        self.assertIn("--vdl2 vdl2:5555", block)
-        self.assertIn("--transport ws", block)
-        self.assertIn("${SKYWATCH_CENTRAL_URL}", block)
-        self.assertIn("--token-env SKYWATCH_INGEST_TOKEN", block)
+        svc = self._load_compose()["services"].get("skywatch-edge")
+        self.assertIsNotNone(svc, "skywatch-edge service missing")
+        self.assertEqual(svc["profiles"], ["skywatch-edge"])
+        cmd = svc["command"]
+        self.assertIsInstance(cmd, list, "command must be list-form")
+        # Invokes the edge entry point.
+        self.assertEqual(cmd[:3], ["python3", "-m", "skywatch.edge"])
+        # Flags wired with the expected values.
+        self.assertEqual(self._flag_value(cmd, "--beast"), "ultrafeeder:30005")
+        self.assertEqual(self._flag_value(cmd, "--vdl2"), "vdl2:5555")
+        self.assertEqual(self._flag_value(cmd, "--transport"), "ws")
+        self.assertEqual(self._flag_value(cmd, "--central"),
+                         "${SKYWATCH_CENTRAL_URL}")
+        self.assertEqual(self._flag_value(cmd, "--token-env"),
+                         "SKYWATCH_INGEST_TOKEN")
         # No port mappings — edge is outbound-only.
-        self.assertNotIn("8080:8080", block)
-        self.assertNotIn("8765:8765", block)
+        self.assertNotIn("ports", svc)
+
+    def test_compose_commands_are_list_form(self):
+        """Regression: previously the `vdl2`, `skywatch`, and
+        `skywatch-edge` services used folded-scalar string commands
+        which preserved newlines mid-command when subsequent lines
+        were more-indented than the first, causing the container's
+        shell to interpret each line as a separate command.  List
+        form makes YAML folding inapplicable.  Lock that in."""
+        svcs = self._load_compose()["services"]
+        for name in ("vdl2", "skywatch", "skywatch-edge"):
+            cmd = svcs[name]["command"]
+            self.assertIsInstance(cmd, list,
+                f"{name}.command must be list-form (got {type(cmd).__name__})")
+            for i, arg in enumerate(cmd):
+                self.assertNotIn("\n", str(arg),
+                    f"{name}.command[{i}] contains an embedded newline: {arg!r}")
 
 
 if __name__ == "__main__":

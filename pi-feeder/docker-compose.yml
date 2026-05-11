@@ -104,12 +104,27 @@ services:
       SKYWATCH_LAT: ${FEEDER_LAT}
       SKYWATCH_LON: ${FEEDER_LON}
       SKYWATCH_TZ: ${FEEDER_TZ}
-    command: >-
-      python3 -m skywatch
-        --beast ultrafeeder:30005 --name local
-        --vdl2 vdl2:5555 --vdl2-name vdl2
-        --rx-lat ${FEEDER_LAT} --rx-lon ${FEEDER_LON}
-        --http 0.0.0.0:8080 --ws 0.0.0.0:8765
+    # List-form so YAML cannot fold/preserve newlines mid-command.
+    command:
+      - python3
+      - -m
+      - skywatch
+      - --beast
+      - ultrafeeder:30005
+      - --name
+      - local
+      - --vdl2
+      - vdl2:5555
+      - --vdl2-name
+      - vdl2
+      - --rx-lat
+      - ${FEEDER_LAT}
+      - --rx-lon
+      - ${FEEDER_LON}
+      - --http
+      - 0.0.0.0:8080
+      - --ws
+      - 0.0.0.0:8765
 
   # ─── Skywatch in EDGE mode (sender to a remote central) ──────────
   # Use this profile when the Pi only does receive/decode and pushes
@@ -139,16 +154,29 @@ services:
     # to disk; volume is host-local so it survives container recreate.
     volumes:
       - skywatch_edge_spool:/var/lib/skywatch
-    command: >-
-      python3 -m skywatch.edge
-        --beast ultrafeeder:30005
-        --vdl2 vdl2:5555
-        --name ${SKYWATCH_EDGE_NAME:-edge}
-        --rx-lat ${FEEDER_LAT} --rx-lon ${FEEDER_LON}
-        --transport ws
-        --central ${SKYWATCH_CENTRAL_URL}
-        --token-env SKYWATCH_INGEST_TOKEN
-        --spool /var/lib/skywatch/spool.sqlite
+    # List-form so YAML cannot fold/preserve newlines mid-command.
+    command:
+      - python3
+      - -m
+      - skywatch.edge
+      - --beast
+      - ultrafeeder:30005
+      - --vdl2
+      - vdl2:5555
+      - --name
+      - ${SKYWATCH_EDGE_NAME:-edge}
+      - --rx-lat
+      - ${FEEDER_LAT}
+      - --rx-lon
+      - ${FEEDER_LON}
+      - --transport
+      - ws
+      - --central
+      - ${SKYWATCH_CENTRAL_URL}
+      - --token-env
+      - SKYWATCH_INGEST_TOKEN
+      - --spool
+      - /var/lib/skywatch/spool.sqlite
 
   # ─── VDL2 (136 MHz) ──────────────────────────────────────────────
   vdl2:
@@ -167,15 +195,16 @@ services:
       # Run dumpvdl2 against the second dongle directly (no rtl_tcp
       # needed when the container has USB passthrough).
       RTL_TCP_HOST: ""
-    command: >-
-      sh -c "
-        dumpvdl2
-          --rtlsdr 0
-          --gain ${SDR_VDL2_GAIN}
-          --output decoded:json:file:path=/dev/stdout
-          136725000 136775000 136825000 136875000 136975000
-        | ncat -l -k -p 5555 --send-only
-      "
+    # List-form so YAML cannot fold/preserve newlines mid-command.
+    # Single `sh -c` string — needed for the pipe into ncat.  Five
+    # operational European VDL2 channels fit a 1.05 MS/s capture
+    # centred on 136.85 MHz.  ${SDR_VDL2_SERIAL} resolves to the
+    # dongle's rtl_eeprom name (default: rtlsdr-vdl2), avoiding
+    # USB-bus reorder races.
+    command:
+      - sh
+      - -c
+      - "exec dumpvdl2 --rtlsdr ${SDR_VDL2_SERIAL} --gain ${SDR_VDL2_GAIN} --output decoded:json:file:path=/dev/stdout 136725000 136775000 136825000 136875000 136975000 | ncat -l -k -p 5555 --send-only"
 
   # ─── FlightAware / PiAware ───────────────────────────────────────
   piaware:
