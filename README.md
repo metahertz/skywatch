@@ -132,13 +132,44 @@ local feeder:
 python3 -m skywatch --beast feed.example.org:30005
 ```
 
+### Receiving CPDLC (and ACARS)
+
+Controller-Pilot Data Link messaging operates on **VDL Mode 2** at
+~136 MHz VHF (in some regions also HFDL or SATCOM) — *not* on 1090.
+To pick up CPDLC and ACARS traffic, pair skywatch with the external
+[`dumpvdl2`](https://github.com/szpajder/dumpvdl2) decoder running on
+a second SDR tuned to 136 MHz.  Skywatch correlates the two streams
+by ICAO 24-bit address and surfaces VDL2 messages alongside 1090
+traffic in the detail pane and event ticker.
+
+Sketch:
+
+```bash
+# 1. Run dumpvdl2 (separate SDR on 136 MHz), JSON output on TCP.
+dumpvdl2 --rtlsdr 1 --output decoded:json:tcp:address=127.0.0.1,port=5555 \
+         136975000 136725000 136875000
+
+# 2. Run skywatch with both ingest paths.
+python3 -m skywatch \
+    --beast localhost:30005 \
+    --vdl2  localhost:5555 --vdl2-name home \
+    --lat $LAT --lon $LON
+```
+
+CPDLC messages appear in the global event ticker tagged `CPDLC ▲` /
+`▼` (uplink / downlink), in the per-aircraft `EVENTS` filter, and in a
+new `COMMS` section of the detail pane.  Receive-only — the project
+does not transmit on 136 MHz any more than it does on 1090.
+
 ### CLI options
 
 ```
 python3 -m skywatch --help
 
-  --beast HOST:PORT    Connect to a dump1090 BEAST source
+  --beast HOST:PORT    Connect to a dump1090 BEAST source (repeatable)
                        (default: synthetic generator)
+  --vdl2  HOST:PORT    Connect to a dumpvdl2 JSON output (repeatable)
+                       — adds CPDLC / ACARS / VDL2 link-mgmt traffic
   --http  HOST:PORT    HTTP bind for the web UI (default: 127.0.0.1:8080)
   --ws    HOST:PORT    WebSocket bind for live state (default: 127.0.0.1:8765)
   --lat / --lon        Receiver position (decimal degrees)

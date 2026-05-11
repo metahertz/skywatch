@@ -28,7 +28,7 @@ from skywatch.edge.spool import Spool
 from skywatch.state import StateEngine
 from skywatch.state.aircraft import Aircraft
 from skywatch.transport import (
-    DELTA_TYPE_AIRCRAFT, DELTA_TYPE_EVENT,
+    DELTA_TYPE_AIRCRAFT, DELTA_TYPE_COMMS, DELTA_TYPE_EVENT,
     DELTA_TYPE_RECEIVER, Delta, Transport,
 )
 
@@ -50,10 +50,14 @@ class EdgeRunner:
         max_range_nm: float = 280.0,
         spool_path: Path | None = None,
         info_lookup=None,
+        vdl2_host: str | None = None,
+        vdl2_port: int | None = None,
     ):
         self.receiver_id = receiver_id
         self.beast_host = beast_host
         self.beast_port = beast_port
+        self.vdl2_host = vdl2_host
+        self.vdl2_port = vdl2_port
         self.transport = transport
         self.spool = Spool(spool_path) if spool_path else None
 
@@ -78,9 +82,15 @@ class EdgeRunner:
         )
         # Wire engine emissions to the transport.
         self.engine.subscribe(self._on_engine_event)
+        # Per-VDL2-frame hook: ship a dedicated comms delta so the
+        # central populates its `comms` time-series collection.
+        # Without this, only the embedded Aircraft.comms list (inside
+        # DELTA_TYPE_AIRCRAFT) and the ticker event survive the trip.
+        self.engine.on_vdl2_frame = self._ship_comms_delta
 
         self._stop = threading.Event()
         self._beast_thread: threading.Thread | None = None
+        self._vdl2_thread: threading.Thread | None = None
         self._spool_thread: threading.Thread | None = None
 
     # -- lifecycle ----------------------------------------------------
@@ -95,6 +105,13 @@ class EdgeRunner:
             name=f"skywatch-edge-beast-{self.receiver_id}",
         )
         self._beast_thread.start()
+        # VDL2 input thread (optional).
+        if self.vdl2_host and self.vdl2_port:
+            self._vdl2_thread = threading.Thread(
+                target=self._vdl2_loop, daemon=True,
+                name=f"skywatch-edge-vdl2-{self.receiver_id}",
+            )
+            self._vdl2_thread.start()
         # Spool drain thread (only if spool configured)
         if self.spool is not None:
             self._spool_thread = threading.Thread(
@@ -105,7 +122,7 @@ class EdgeRunner:
 
     def stop(self) -> None:
         self._stop.set()
-        for t in (self._beast_thread, self._spool_thread):
+        for t in (self._beast_thread, self._vdl2_thread, self._spool_thread):
             if t is not None:
                 t.join(timeout=2.0)
         if self.spool is not None:
@@ -147,6 +164,27 @@ class EdgeRunner:
         if rx is None:
             return
         self._ship(DELTA_TYPE_RECEIVER, rx.to_dict())
+
+    def _ship_comms_delta(self, frame) -> None:
+        """Engine on_vdl2_frame hook: emit one DELTA_TYPE_COMMS per
+        VDL2 frame so the central can populate its dedicated `comms`
+        time-series collection.  Wire shape is documented alongside
+        the constant in skywatch/transport/__init__.py."""
+        self._ship(DELTA_TYPE_COMMS, {
+            "ts": frame.ts,
+            "frame_ts": frame.frame_ts,
+            "src_icao": frame.src_icao,
+            "dst_icao": frame.dst_icao,
+            "aircraft_icao": frame.aircraft_icao,
+            "direction": frame.direction,
+            "kind": frame.kind,
+            "label": frame.label,
+            "text": frame.text,
+            "flight": frame.flight,
+            "reg": frame.reg,
+            "sig_level": frame.sig_level,
+            "raw": frame.raw,
+        })
 
     # -- spool drain --------------------------------------------------
 
@@ -220,6 +258,60 @@ class EdgeRunner:
                     rx.connected = False
                     # Tell the central about the disconnect.
                     self._push_receiver_state()
+            if not self._stop.is_set():
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    # -- VDL2 input loop ---------------------------------------------
+
+    def _vdl2_loop(self) -> None:
+        """Mirror of `_beast_loop` for one dumpvdl2 JSON source.
+
+        dumpvdl2 emits newline-delimited JSON on TCP.  Each line goes
+        through `parse_vdl2_line()` and into `engine.feed_vdl2()`,
+        which fires the `on_vdl2_frame` hook this runner registered
+        — that hook in turn ships a `DELTA_TYPE_COMMS` envelope per
+        frame.
+        """
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        backoff = 1.0
+        while not self._stop.is_set():
+            sock = None
+            try:
+                log.info("[%s] connecting to dumpvdl2 %s:%d",
+                         self.receiver_id, self.vdl2_host, self.vdl2_port)
+                sock = socket.create_connection(
+                    (self.vdl2_host, self.vdl2_port), timeout=5)
+                sock.settimeout(None)
+                log.info("[%s] connected (vdl2)", self.receiver_id)
+                backoff = 1.0
+                buf = bytearray()
+                while not self._stop.is_set():
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        log.warning("[%s] dumpvdl2 source closed",
+                                    self.receiver_id)
+                        break
+                    buf.extend(chunk)
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl < 0:
+                            break
+                        line = bytes(buf[:nl]).decode("utf-8", "replace")
+                        del buf[:nl + 1]
+                        frame = parse_vdl2_line(
+                            line, receiver_id=self.receiver_id)
+                        if frame is not None:
+                            self.engine.feed_vdl2(frame)
+            except (OSError, ConnectionError) as e:
+                log.warning("[%s] dumpvdl2 error: %s — reconnect in %.1fs",
+                            self.receiver_id, e, backoff)
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
             if not self._stop.is_set():
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 30.0)

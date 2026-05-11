@@ -25,6 +25,7 @@
         <div class="stat"><span class="lbl">DROP</span><span class="val" id="stat-drop">0</span></div>
         <div class="stat"><span class="lbl">A/C</span><span class="val" id="stat-aircraft">0</span></div>
         <div class="stat" id="stat-rx" hidden><span class="lbl">RX</span><span class="val">0/0</span></div>
+        <div class="stat" id="stat-vdl2" hidden title="VDL Mode 2 frames received this session (CPDLC / ACARS)"><span class="lbl">VDL2</span><span class="val">0</span></div>
         <div class="stat" id="conn-stat"><span class="lbl">LINK</span><span class="val">DISCONN</span></div>
         <button class="toggle-btn" id="route-toggle" hidden
                 title="Look up origin/destination airports via adsbdb.com. Each lookup transmits the callsign to the third-party API.">
@@ -96,6 +97,8 @@
           <span class="detail-toggle-lbl">VIEW</span>
           <button class="detail-mode-btn" data-mode="compact">COMPACT</button>
           <button class="detail-mode-btn" data-mode="verbose">VERBOSE · SRC</button>
+          <button class="detail-mode-btn" id="isolate-btn" disabled
+                  title="Hide all other aircraft on the map; show only the selected aircraft. Click again to restore.">ISOLATE</button>
         </div>
         <div id="detail-content">
           <div class="detail-empty">Click an aircraft to inspect.<br><br>State observed live from 1090 MHz.</div>
@@ -103,7 +106,17 @@
       </aside>
 
       <section class="events-pane">
-        <h3>EVENT TICKER</h3>
+        <h3>
+          EVENT TICKER
+          <span class="ev-filter" id="event-filter">
+            <button class="ev-filter-btn" data-filter="all"
+                    title="Show all event types">ALL</button>
+            <button class="ev-filter-btn" data-filter="adsb"
+                    title="ADS-B / Mode S only — TCAS, intent changes, emergency, new contacts">1090</button>
+            <button class="ev-filter-btn" data-filter="vdl2"
+                    title="VDL2 only — CPDLC, ACARS, link management">VDL2</button>
+          </span>
+        </h3>
         <ul id="event-log"></ul>
       </section>
 

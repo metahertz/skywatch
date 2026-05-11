@@ -112,10 +112,22 @@ class StateEngine:
         self.total_frames = 0
         self.frames_by_df: dict[int, int] = defaultdict(int)
         self.frames_dropped: int = 0
+        # Parallel counter for VDL2 ingest (CPDLC / ACARS / link mgmt).
+        # Tracked separately from `total_frames` so the topbar can show
+        # both 1090 and 136 MHz traffic rates side by side.
+        self.total_vdl2_frames = 0
         self.start_time = time.time()
 
         # Listeners for state-change events
         self._listeners: list[Callable[[dict], None]] = []
+
+        # Optional per-VDL2-frame hook.  Edge runners register this so
+        # every parsed VdlFrame can be shipped as a dedicated
+        # DELTA_TYPE_COMMS envelope (in addition to the embedded
+        # `comms` list inside the aircraft update and the ticker event).
+        # Monolithic mode leaves it None; the listener fanout already
+        # carries everything the UI needs.
+        self.on_vdl2_frame: Callable[[object], None] | None = None
 
         # Recent global event log (for the UI's event ticker)
         self.events: deque = deque(maxlen=200)
@@ -184,6 +196,142 @@ class StateEngine:
     def subscribe(self, callback: Callable[[dict], None]) -> None:
         self._listeners.append(callback)
 
+    def feed_vdl2(self, frame) -> None:
+        """Feed one VDL2 frame (from dumpvdl2 JSON) into the engine.
+
+        Parallel ingest path to feed() — VDL2 carries CPDLC, ACARS and
+        link-management traffic on a different physical layer (~136 MHz)
+        but is correlated with 1090 traffic by ICAO-24 address.
+
+        Each frame is appended to the matching Aircraft's `comms` deque
+        and emits a structured engine event so the UI ticker picks it
+        up.  Aircraft seen for the first time on VDL2 (no prior 1090
+        contact) are created on-sight; subsequent 1090 frames merge into
+        the same Aircraft naturally.
+        """
+        self.total_vdl2_frames += 1
+        rx = self.receivers.get_or_create(frame.receiver_id)
+        rx.vdl2_frames_total += 1
+        rx.last_frame_at = time.time()
+        rx.connected = True
+
+        if not frame.aircraft_icao:
+            # Frame doesn't reference an aircraft (peer-to-peer ground,
+            # or unknown side).  We still log it on the global ticker
+            # for situational awareness, but no per-aircraft state.
+            self._log_event(self._comms_event(frame, icao=None))
+            if self.on_vdl2_frame is not None:
+                try:
+                    self.on_vdl2_frame(frame)
+                except Exception:
+                    log.exception("on_vdl2_frame hook failed")
+            return
+
+        icao = frame.aircraft_icao
+        ac = self._get_or_create_aircraft(icao, time.time())
+        # Roster the address so subsequent address-parity recoveries
+        # from short Mode S replies (DF0/4/5) succeed even before
+        # we hear a DF11/17/18 squitter from this aircraft on 1090.
+        self._squitter_roster.setdefault(icao, time.time())
+
+        # Reassembly: ACARS messages > ~210 bytes are split across
+        # multiple blocks with a `more` bit.  When a continuation
+        # arrives, mutate the existing comms entry in place rather
+        # than appending a new one — the detail-pane reads the
+        # latest serialised state, so the operator sees a single
+        # growing message instead of 3-5 fragments.  The events
+        # ticker still gets every block as a separate event below.
+        acars_block = (frame.payload.get("acars")
+                       if isinstance(frame.payload.get("acars"), dict)
+                       else None)
+        more = bool(acars_block and acars_block.get("more"))
+        msg_num = acars_block.get("msg_num") if acars_block else None
+        # Reassembly key is per-(label, msg_num); both must be set
+        # for us to risk concatenation.  Without msg_num we treat
+        # each block as standalone.
+        reasm_key = (frame.label, msg_num) if (
+            frame.kind == "acars" and frame.label and msg_num) else None
+
+        existing = ac._pending_acars.get(reasm_key) if reasm_key else None
+        if existing is not None:
+            # Continuation block — append to the in-flight entry.
+            joined = (existing.get("text") or "") + (
+                " " if existing.get("text") and frame.text else ""
+            ) + (frame.text or "")
+            existing["text"] = joined
+            existing["blocks"] = existing.get("blocks", 1) + 1
+            existing["ts"] = frame.ts
+            if not more:
+                existing["complete"] = True
+                ac._pending_acars.pop(reasm_key, None)
+        else:
+            # New entry — single-block message OR first block of a
+            # multi-block one.
+            comms_entry = {
+                "ts": frame.ts,
+                "kind": frame.kind,
+                "direction": frame.direction,
+                "label": frame.label,
+                "text": frame.text,
+                "peer": (frame.dst_icao if frame.direction == "downlink"
+                         else frame.src_icao),
+                "receiver_id": frame.receiver_id,
+                "flight": frame.flight,
+                "blocks": 1,
+                "complete": not more,
+            }
+            ac.comms.append(comms_entry)
+            if more and reasm_key:
+                ac._pending_acars[reasm_key] = comms_entry
+
+        # If the ACARS message reports a registration / flight number
+        # we don't have yet, opportunistically copy it across — these
+        # are the same fields the existing 1090 BDS 2,0 path populates,
+        # so VDL2 fills coverage gaps for aircraft we hear on VHF
+        # before we hear them on UHF.
+        if frame.flight and not ac.callsign:
+            ac.callsign = frame.flight.strip()
+            self._refresh_info(ac)
+
+        # Persist + UI broadcast via the existing channels.
+        if self.store is not None:
+            self.store.enqueue_comms(frame)
+        # Events ticker: ALWAYS one event per block, regardless of
+        # reassembly — the ticker shows raw activity, the COMMS
+        # section shows the merged message.
+        self._log_event(self._comms_event(frame, icao=icao))
+        self._emit_update(ac)
+        # Edge runner hook: ship a DELTA_TYPE_COMMS envelope so the
+        # central can populate its dedicated `comms` time-series
+        # collection.  None in monolithic mode.
+        if self.on_vdl2_frame is not None:
+            try:
+                self.on_vdl2_frame(frame)
+            except Exception:
+                log.exception("on_vdl2_frame hook failed")
+
+    @staticmethod
+    def _comms_event(frame, icao: str | None) -> dict:
+        """Build the dict shipped to the WS event ticker for one VDL2 frame."""
+        ev_type = {
+            "cpdlc": "cpdlc_msg",
+            "acars": "acars_msg",
+            "atn_cm": "vdl2_link",
+            "link_mgmt": "vdl2_link",
+        }.get(frame.kind, "vdl2_msg")
+        return {
+            "t": frame.ts,
+            "type": ev_type,
+            "icao": icao,
+            "callsign": frame.flight,
+            "kind": frame.kind,
+            "direction": frame.direction,
+            "label": frame.label,
+            "summary": frame.text or frame.label or frame.kind,
+            "source": "VDL2",
+            "receiver_id": frame.receiver_id,
+        }
+
     def feed(self, frame: BeastFrame) -> None:
         """Feed one BEAST frame into the engine."""
         self.total_frames += 1
@@ -243,6 +391,7 @@ class StateEngine:
             "aircraft": [a.to_dict() for a in self.aircraft.values()],
             "stats": {
                 "total_frames": self.total_frames,
+                "total_vdl2_frames": self.total_vdl2_frames,
                 "frames_by_df": dict(self.frames_by_df),
                 "frames_dropped": self.frames_dropped,
                 "uptime_s": time.time() - self.start_time,

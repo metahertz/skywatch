@@ -172,6 +172,22 @@ class Aircraft:
     # Position trail
     trail: deque = field(default_factory=lambda: deque(maxlen=120))
 
+    # Recent VDL2 / CPDLC / ACARS messages for this aircraft.  Each
+    # entry is a small dict produced by StateEngine.feed_vdl2().  Capped
+    # so a chatty aircraft (frequent ACARS POSREPs) can't blow up
+    # serialised payload size.  Empty when no VDL2 ingest is configured.
+    comms: deque = field(default_factory=lambda: deque(maxlen=50))
+
+    # Multi-block ACARS reassembly buffer, keyed by (label, msg_num).
+    # ACARS messages longer than ~210 bytes are split into multiple
+    # blocks tagged with a `more` bit.  We mutate the corresponding
+    # entry in `comms` in place as continuation blocks arrive, so the
+    # detail-pane COMMS section shows one logical message rather than
+    # 3-5 fragments.  Each entry references the same dict object that
+    # lives in `comms`; cleared when the final block (more=False)
+    # arrives.  Not serialised.
+    _pending_acars: dict = field(default_factory=dict)
+
     # Internal: CPR pair buffer (private; not serialised).
     # Keyed by receiver_id so the engine can pair an even and odd half
     # only when they came from the SAME receiver.  Cross-receiver
@@ -312,4 +328,5 @@ class Aircraft:
             "by_receiver": {
                 rid: att.to_dict() for rid, att in self.by_receiver.items()
             },
+            "comms": list(self.comms),
         }

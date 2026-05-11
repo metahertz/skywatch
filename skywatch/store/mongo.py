@@ -47,9 +47,11 @@ _DEFAULT_DB = "skywatch"
 _FRAMES_TTL_S = 24 * 3600          # 1 day of raw frames by default
 _METRICS_TTL_S = 7 * 24 * 3600     # 7 days of receiver health
 _EVENTS_TTL_S = 30 * 24 * 3600     # 30 days of events
+_COMMS_TTL_S = 30 * 24 * 3600      # 30 days of VDL2/CPDLC/ACARS messages
 _FRAME_QUEUE_MAX = 5000            # hot-path queue depth before drops
 _FRAME_FLUSH_BATCH = 200           # max docs per insert_many
 _FRAME_FLUSH_INTERVAL_S = 1.0      # flush at least this often
+_COMMS_QUEUE_MAX = 2000            # comms volume is much lower than frames
 
 
 class MongoStore:
@@ -59,25 +61,35 @@ class MongoStore:
     def __init__(self, uri: str, db_name: str = _DEFAULT_DB,
                  frame_ttl_s: int = _FRAMES_TTL_S,
                  metrics_ttl_s: int = _METRICS_TTL_S,
-                 events_ttl_s: int = _EVENTS_TTL_S) -> None:
+                 events_ttl_s: int = _EVENTS_TTL_S,
+                 comms_ttl_s: int = _COMMS_TTL_S) -> None:
         self.uri = uri
         self.db_name = db_name
         self._frame_ttl_s = frame_ttl_s
         self._metrics_ttl_s = metrics_ttl_s
         self._events_ttl_s = events_ttl_s
+        self._comms_ttl_s = comms_ttl_s
 
         self._client: pymongo.MongoClient | None = None
         self._db = None
 
-        # Hot-path queue + background writer
+        # Hot-path queue + background writer (frames archive)
         self._frame_q: queue.Queue = queue.Queue(maxsize=_FRAME_QUEUE_MAX)
+        # Parallel queue for VDL2/CPDLC/ACARS messages.  Lower volume
+        # than frames but worth its own queue + writer so a flood of
+        # 1090 frames can't starve comms persistence.
+        self._comms_q: queue.Queue = queue.Queue(maxsize=_COMMS_QUEUE_MAX)
         self._stop = threading.Event()
         self._writer: threading.Thread | None = None
+        self._comms_writer: threading.Thread | None = None
 
         # Counters exposed for stats/debug
         self.frames_written = 0
         self.frames_dropped_queue = 0
         self.frames_dropped_error = 0
+        self.comms_written = 0
+        self.comms_dropped_queue = 0
+        self.comms_dropped_error = 0
 
     # -- lifecycle -----------------------------------------------------
 
@@ -95,17 +107,24 @@ class MongoStore:
             target=self._writer_loop, daemon=True, name="skywatch-mongo-writer",
         )
         self._writer.start()
+        self._comms_writer = threading.Thread(
+            target=self._comms_writer_loop, daemon=True,
+            name="skywatch-mongo-comms-writer",
+        )
+        self._comms_writer.start()
         log.info("MongoStore connected to %s/%s", self.uri, self.db_name)
 
     def stop(self) -> None:
         self._stop.set()
-        # Unblock the writer's queue.get
-        try:
-            self._frame_q.put_nowait(None)
-        except queue.Full:
-            pass
-        if self._writer is not None:
-            self._writer.join(timeout=2.0)
+        # Unblock the writer queues.
+        for q in (self._frame_q, self._comms_q):
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+        for t in (self._writer, self._comms_writer):
+            if t is not None:
+                t.join(timeout=2.0)
         if self._client is not None:
             self._client.close()
 
@@ -149,6 +168,29 @@ class MongoStore:
                 )
             except CollectionInvalid:
                 pass
+
+        # comms (time-series).  VDL2 / CPDLC / ACARS message archive,
+        # one doc per VdlFrame.  Same metaField pattern as `frames`
+        # so per-receiver queries stay fast.
+        if "comms" not in existing:
+            try:
+                self._db.create_collection(
+                    "comms",
+                    timeseries={
+                        "timeField": "ts",
+                        "metaField": "receiver_id",
+                        "granularity": "seconds",
+                    },
+                    expireAfterSeconds=self._comms_ttl_s,
+                )
+            except CollectionInvalid:
+                pass
+        # Per-aircraft comms replay.
+        self._db.comms.create_index([("aircraft_icao", 1), ("ts", -1)],
+                                    name="aircraft_ts")
+        # Per-kind filter for "show me all CPDLC" pages.
+        self._db.comms.create_index([("kind", 1), ("ts", -1)],
+                                    name="kind_ts")
 
         # events (regular, TTL by `t`)
         if "events" not in existing:
@@ -236,6 +278,70 @@ class MongoStore:
         except PyMongoError as e:
             self.frames_dropped_error += len(batch)
             log.warning("frame batch insert failed (%d docs): %s",
+                        len(batch), e)
+
+    # -- hot path: VDL2 / CPDLC / ACARS comms -------------------------
+
+    def enqueue_comms(self, vdl_frame) -> None:
+        """Non-blocking enqueue of one VdlFrame.  Drops on overflow."""
+        doc = {
+            "ts": _to_bson_date(vdl_frame.ts),
+            "receiver_id": vdl_frame.receiver_id,
+            "aircraft_icao": vdl_frame.aircraft_icao,
+            "src_icao": vdl_frame.src_icao,
+            "dst_icao": vdl_frame.dst_icao,
+            "direction": vdl_frame.direction,
+            "kind": vdl_frame.kind,
+            "label": vdl_frame.label,
+            "text": vdl_frame.text,
+            "flight": vdl_frame.flight,
+            "reg": vdl_frame.reg,
+            "raw": vdl_frame.raw,
+        }
+        try:
+            self._comms_q.put_nowait(doc)
+        except queue.Full:
+            self.comms_dropped_queue += 1
+
+    def _comms_writer_loop(self) -> None:
+        """Mirror of _writer_loop for the comms time-series collection."""
+        batch: list[dict] = []
+        last_flush = time.time()
+        while not self._stop.is_set():
+            try:
+                timeout = max(0.05, _FRAME_FLUSH_INTERVAL_S -
+                              (time.time() - last_flush))
+                doc = self._comms_q.get(timeout=timeout)
+            except queue.Empty:
+                doc = None
+            if doc is None and self._stop.is_set():
+                break
+            if doc is not None:
+                batch.append(doc)
+            should_flush = (len(batch) >= _FRAME_FLUSH_BATCH or
+                            (batch and time.time() - last_flush >= _FRAME_FLUSH_INTERVAL_S))
+            if should_flush:
+                self._flush_comms(batch)
+                batch = []
+                last_flush = time.time()
+        # Final drain
+        try:
+            while True:
+                batch.append(self._comms_q.get_nowait())
+        except queue.Empty:
+            pass
+        if batch:
+            self._flush_comms(batch)
+
+    def _flush_comms(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+        try:
+            self._db.comms.insert_many(batch, ordered=False)
+            self.comms_written += len(batch)
+        except PyMongoError as e:
+            self.comms_dropped_error += len(batch)
+            log.warning("comms batch insert failed (%d docs): %s",
                         len(batch), e)
 
     # -- cold path: state, events, receivers --------------------------

@@ -38,6 +38,26 @@ DELTA_TYPE_AIRCRAFT = "aircraft"     # per-aircraft state update from one RX
 DELTA_TYPE_EVENT = "event"           # TCAS RA / intent_change / emergency
 DELTA_TYPE_RECEIVER = "receiver"     # receiver registry status
 DELTA_TYPE_METRICS = "metrics"       # per-receiver health sample
+# One per VDL2 frame the edge ingested (CPDLC / ACARS / ATN-CM /
+# link-mgmt).  Carries just the comms-relevant fields produced by
+# `parse_vdl2_line()` — no full Aircraft payload — so the central
+# can populate the dedicated `comms` time-series collection without
+# needing to re-derive the message shape from `Aircraft.comms`.
+#
+# Wire shape (payload):
+#   {
+#     "ts": float,            # frame.ts (edge wall-clock)
+#     "frame_ts": float|None, # dumpvdl2 message timestamp
+#     "src_icao": str|None, "dst_icao": str|None,
+#     "aircraft_icao": str|None,
+#     "direction": "uplink"|"downlink"|"peer",
+#     "kind": "cpdlc"|"acars"|"atn_cm"|"link_mgmt"|"other",
+#     "label": str|None, "text": str|None,
+#     "flight": str|None, "reg": str|None,
+#     "sig_level": float|None,
+#     "raw": str,             # original dumpvdl2 JSON line
+#   }
+DELTA_TYPE_COMMS = "comms"
 
 
 @dataclass

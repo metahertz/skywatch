@@ -241,6 +241,79 @@ class AppServer:
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    def start_vdl2_client(
+        self,
+        host: str,
+        port: int,
+        receiver_id: str | None = None,
+    ) -> None:
+        """Connect to a remote dumpvdl2 JSON output (typically on
+        :5555).  Reads newline-delimited JSON and feeds parsed
+        VdlFrames into engine.feed_vdl2().  Reconnects on failure
+        with exponential backoff identical to the BEAST client.
+        """
+        rid = receiver_id or f"vdl2:{host}:{port}"
+        thread = threading.Thread(
+            target=self._vdl2_client_loop,
+            args=(host, port, rid),
+            daemon=True,
+            name=f"skywatch-vdl2-{rid}",
+        )
+        self._input_threads.append(thread)
+        thread.start()
+
+    def _vdl2_client_loop(
+        self, host: str, port: int, receiver_id: str,
+    ) -> None:
+        """Runs in a thread; reconnects with exponential backoff."""
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        backoff = 1.0
+        while not self._stop.is_set():
+            sock = None
+            try:
+                log.info("[%s] Connecting to dumpvdl2 at %s:%d ...",
+                         receiver_id, host, port)
+                sock = socket.create_connection((host, port), timeout=5)
+                sock.settimeout(None)
+                log.info("[%s] Connected to dumpvdl2 at %s:%d",
+                         receiver_id, host, port)
+                backoff = 1.0
+                # dumpvdl2 emits one JSON document per line.  Read by
+                # accumulating until '\n' so partial network frames
+                # don't truncate a JSON object mid-decode.
+                buf = bytearray()
+                while not self._stop.is_set():
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        log.warning("[%s] dumpvdl2 closed the connection",
+                                    receiver_id)
+                        break
+                    buf.extend(chunk)
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl < 0:
+                            break
+                        line = bytes(buf[:nl]).decode("utf-8", "replace")
+                        del buf[:nl + 1]
+                        frame = parse_vdl2_line(line, receiver_id=receiver_id)
+                        if frame is not None:
+                            self.engine.feed_vdl2(frame)
+            except (OSError, ConnectionError) as e:
+                log.warning("[%s] dumpvdl2 client error: %s — reconnect in %.1fs",
+                            receiver_id, e, backoff)
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                rx = self.engine.receivers.get(receiver_id)
+                if rx is not None:
+                    rx.connected = False
+            if not self._stop.is_set():
+                self._stop.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+
     def start_synthetic_input(self, scenario=None, time_scale: float = 1.0) -> None:
         """Run the synthetic message generator as input source."""
         from skywatch.decoder.synthetic import default_scenario

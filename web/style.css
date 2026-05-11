@@ -787,6 +787,23 @@ body::before {
   background: rgba(245, 184, 61, 0.08);
 }
 
+.detail-mode-btn:disabled,
+.detail-mode-btn[disabled] {
+  color: var(--fg-faint);
+  border-color: rgba(120, 200, 200, 0.08);
+  cursor: not-allowed;
+}
+.detail-mode-btn:disabled:hover,
+.detail-mode-btn[disabled]:hover {
+  color: var(--fg-faint);
+  border-color: rgba(120, 200, 200, 0.08);
+}
+
+/* The ISOLATE button is right-aligned in the detail-toggle row to
+ * visually separate it from the VIEW mode buttons.  Same styling as
+ * a regular .detail-mode-btn otherwise. */
+#isolate-btn { margin-left: auto; }
+
 .detail-empty {
   padding: 24px;
   color: var(--fg-dim);
@@ -1128,10 +1145,94 @@ body::before {
 .ev-list .ev-row.ev-tcas .ev-msg  { color: var(--red-bright); font-weight: 500; }
 .ev-list .ev-row.ev-emerg .ev-msg { color: var(--amber-bright); }
 .ev-list .ev-row.ev-intent .ev-msg { color: var(--cyan); }
+.ev-list .ev-row.ev-cpdlc .ev-msg { color: var(--cyan); font-weight: 500; }
+.ev-list .ev-row.ev-acars .ev-msg { color: var(--fg-primary); }
+.ev-list .ev-row.ev-vdl2  .ev-msg { color: var(--fg-dim); }
 .ev-empty {
   color: var(--fg-faint);
   font-size: 10px;
   font-style: italic;
+}
+
+/* COMMS block in the detail pane — VDL2 / CPDLC / ACARS messages
+ * exchanged with the selected aircraft.  Tighter than the events list
+ * since each row carries direction + label + decoded text. */
+.c-count {
+  color: var(--fg-dim);
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  margin-left: 6px;
+  text-transform: none;
+}
+.comms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-active) var(--bg-pane);
+}
+.comms-row {
+  display: grid;
+  grid-template-columns: 56px 16px auto 1fr;
+  column-gap: 6px;
+  font-size: 10px;
+  line-height: 1.35;
+  padding: 1px 0;
+  border-bottom: 1px solid rgba(120, 200, 200, 0.04);
+}
+.comms-row:last-child { border-bottom: none; }
+.comms-row .c-t      { color: var(--fg-dim); font-size: 9px; font-variant-numeric: tabular-nums; }
+.comms-row .c-arrow  { color: var(--fg-dim); text-align: center; }
+.comms-row .c-label  { color: var(--fg-bright); font-weight: 500; }
+.comms-row .c-text   { color: var(--fg-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Per-kind tinting */
+.comms-row.comms-cpdlc .c-text  { color: var(--cyan); font-weight: 500; }
+.comms-row.comms-cpdlc .c-arrow { color: var(--cyan); }
+.comms-row.comms-acars .c-text  { color: var(--fg-primary); }
+.comms-row.comms-atn_cm .c-text,
+.comms-row.comms-link_mgmt .c-text { color: var(--fg-dim); }
+
+/* Block-count badge on reassembled multi-block ACARS messages.
+ * Shows "×3" when a logical message arrived as 3 ACARS blocks. */
+.comms-row .c-blocks {
+  color: var(--amber);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  margin-left: 4px;
+}
+
+/* H1 wind/temperature grid table.  Renders inside a comms-row when
+ * the heuristic in app.js detects the airline wind-aloft format.
+ * Spans the full grid width below the c-t / c-arrow / c-label cells
+ * (column 4 of the comms-row grid, but extends visually). */
+.comms-row .h1-wind-table {
+  grid-column: 4 / -1;       /* place under the c-text column, full width */
+  border-collapse: collapse;
+  font-size: 9.5px;
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.comms-row .h1-wind-table th {
+  text-align: right;
+  padding: 0 6px 1px 0;
+  color: var(--fg-dim);
+  font-weight: 500;
+  font-size: 8.5px;
+  letter-spacing: 0.05em;
+}
+.comms-row .h1-wind-table td {
+  text-align: right;
+  padding: 0 6px 0 0;
+  color: var(--fg-primary);
+}
+.comms-row .h1-wind-table td.alt { color: var(--cyan); }
+.comms-row .h1-wind-table td.sat { color: var(--amber-bright); }
+.comms-row .h1-wind-table tbody tr:nth-child(even) td {
+  background: rgba(120, 200, 200, 0.03);
 }
 
 /* Compact-view footer: tiny one-liner replacing the BDS-pills /
@@ -1178,6 +1279,37 @@ body::before {
   color: var(--amber);
   border-bottom: var(--hairline);
   background: var(--bg-cell);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Live ticker filter — segmented control in the EVENT TICKER header.
+ * ALL / 1090 / VDL2.  Persisted to localStorage. */
+.ev-filter {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+}
+.ev-filter-btn {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid rgba(120, 200, 200, 0.15);
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+}
+.ev-filter-btn:hover {
+  color: var(--fg-bright);
+  border-color: rgba(120, 200, 200, 0.4);
+}
+.ev-filter-btn.active {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: rgba(245, 184, 61, 0.08);
 }
 
 #event-log {
@@ -1221,6 +1353,12 @@ body::before {
   font-size: 9px;
   letter-spacing: 0.05em;
 }
+/* VDL2-family ticker rows: CPDLC pops bright cyan (the operationally
+ * interesting traffic), ACARS sits at primary phosphor green, link
+ * management dims into the background. */
+#event-log li.ev-cpdlc .ev-msg { color: var(--cyan); font-weight: 500; }
+#event-log li.ev-acars .ev-msg { color: var(--fg-primary); }
+#event-log li.ev-vdl2  .ev-msg { color: var(--fg-dim); }
 
 /* ─── RA TIMELINE ────────────────────────────────────────────────── */
 

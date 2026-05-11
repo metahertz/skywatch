@@ -48,6 +48,13 @@ def main(argv=None) -> int:
         help="dump1090 BEAST source (default port 30005).",
     )
     parser.add_argument(
+        "--vdl2", metavar="HOST:PORT", default=None,
+        help="Optional dumpvdl2 JSON source for this site (default port "
+             "5555).  When set, VDL2 / CPDLC / ACARS frames decoded "
+             "locally are shipped to the central as DELTA_TYPE_COMMS "
+             "envelopes alongside the BEAST-derived aircraft updates.",
+    )
+    parser.add_argument(
         "--name", required=True,
         help="Stable receiver_id; appears in central's by_receiver attribution.",
     )
@@ -113,9 +120,13 @@ def main(argv=None) -> int:
 
     # Build and start the runner.
     beast_host, beast_port = _parse_endpoint(args.beast, 30005)
+    vdl2_host = vdl2_port = None
+    if args.vdl2:
+        vdl2_host, vdl2_port = _parse_endpoint(args.vdl2, 5555)
     runner = EdgeRunner(
         receiver_id=args.name,
         beast_host=beast_host, beast_port=beast_port,
+        vdl2_host=vdl2_host, vdl2_port=vdl2_port,
         transport=transport,
         receiver_lat=args.rx_lat,
         receiver_lon=args.rx_lon,

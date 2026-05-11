@@ -936,5 +936,359 @@ class TestEdgeRunner(unittest.TestCase):
             self.assertEqual(d.receiver_id, "rx-edge")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# VDL Mode 2 / CPDLC ingest: parser + engine integration.
+# ─────────────────────────────────────────────────────────────────────
+
+import os as _os
+_FIXTURES = _os.path.join(_os.path.dirname(__file__), "fixtures", "vdl2")
+
+
+def _load_fixture(name: str) -> str:
+    with open(_os.path.join(_FIXTURES, name)) as f:
+        return f.read()
+
+
+class TestVdl2Parser(unittest.TestCase):
+    """VdlFrame parser kind/direction/aircraft classification per
+    canned dumpvdl2 fixture."""
+
+    def test_cpdlc_uplink(self):
+        from skywatch.decoder.vdl2 import (
+            parse_vdl2_line, KIND_CPDLC, DIR_UPLINK,
+        )
+        f = parse_vdl2_line(_load_fixture("cpdlc_uplink.json"), "rx1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f.kind, KIND_CPDLC)
+        self.assertEqual(f.direction, DIR_UPLINK)
+        self.assertEqual(f.aircraft_icao, "4CA8D5")
+        self.assertEqual(f.dst_icao, "4CA8D5")
+        self.assertIsNone(f.src_icao)         # ground station, not aircraft
+        self.assertIn("CLIMB TO FL360", f.text or "")
+
+    def test_cpdlc_downlink_wilco(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line, DIR_DOWNLINK
+        f = parse_vdl2_line(_load_fixture("cpdlc_downlink_wilco.json"), "rx1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f.direction, DIR_DOWNLINK)
+        self.assertEqual(f.aircraft_icao, "4CA8D5")
+        self.assertEqual(f.src_icao, "4CA8D5")
+        self.assertIn("WILCO", f.text or "")
+
+    def test_acars_posrep(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line, KIND_ACARS, DIR_DOWNLINK
+        f = parse_vdl2_line(_load_fixture("acars_posrep.json"), "rx1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f.kind, KIND_ACARS)
+        self.assertEqual(f.direction, DIR_DOWNLINK)
+        self.assertEqual(f.aircraft_icao, "406B90")
+        self.assertEqual(f.flight, "BAW217")
+        self.assertEqual(f.reg, "G-EUYG")
+        self.assertEqual(f.label, "B0")
+        self.assertIn("POSREP", f.text or "")
+
+    def test_link_mgmt_sabm(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line, KIND_LINK_MGMT
+        f = parse_vdl2_line(_load_fixture("link_mgmt_sabm.json"), "rx1")
+        self.assertIsNotNone(f)
+        self.assertEqual(f.kind, KIND_LINK_MGMT)
+        self.assertEqual(f.aircraft_icao, "4CA8D5")
+        self.assertIn("SABM", f.text or "")
+
+    def test_malformed_returns_none(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        self.assertIsNone(
+            parse_vdl2_line(_load_fixture("malformed.json"), "rx1"))
+
+    def test_empty_string_returns_none(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        self.assertIsNone(parse_vdl2_line("", "rx1"))
+        self.assertIsNone(parse_vdl2_line("   \n", "rx1"))
+
+
+class TestEngineVdl2(unittest.TestCase):
+    """Engine.feed_vdl2: aircraft attribution, comms append, event log."""
+
+    def _engine(self):
+        from skywatch.state import StateEngine
+        return StateEngine()
+
+    def test_cpdlc_creates_aircraft_and_logs_event(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        eng = self._engine()
+        events = []
+        eng.subscribe(lambda env: events.append(env))
+
+        f = parse_vdl2_line(_load_fixture("cpdlc_uplink.json"), "rx1")
+        eng.feed_vdl2(f)
+
+        # Aircraft auto-created on first VDL2 sight.
+        self.assertIn("4CA8D5", eng.aircraft)
+        ac = eng.aircraft["4CA8D5"]
+        self.assertEqual(len(ac.comms), 1)
+        comm = ac.comms[0]
+        self.assertEqual(comm["kind"], "cpdlc")
+        self.assertEqual(comm["direction"], "uplink")
+        self.assertIn("CLIMB TO FL360", comm["text"])
+
+        # cpdlc_msg event fired through the listener channel.
+        ticker = [e for e in events if e.get("type") == "event"
+                  and e["event"].get("type") == "cpdlc_msg"]
+        self.assertEqual(len(ticker), 1)
+        self.assertEqual(ticker[0]["event"]["icao"], "4CA8D5")
+
+    def test_acars_attaches_to_existing_aircraft(self):
+        from skywatch.decoder.synthetic import make_df11_squitter
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        eng = self._engine()
+        # Pre-existing 1090 contact for 406B90.
+        p = BeastParser(receiver_id="rx-1090")
+        for fr in p.feed(encode_beast(make_df11_squitter("406B90"), 0.0)):
+            eng.feed(fr)
+        self.assertIn("406B90", eng.aircraft)
+
+        # ACARS POSREP comes in via VDL2 — same ICAO, attaches to the
+        # already-tracked aircraft.
+        f = parse_vdl2_line(_load_fixture("acars_posrep.json"), "rx-vdl2")
+        eng.feed_vdl2(f)
+        ac = eng.aircraft["406B90"]
+        self.assertEqual(len(ac.comms), 1)
+        self.assertEqual(ac.comms[0]["kind"], "acars")
+        # ACARS reported flight=BAW217; engine should have populated
+        # the callsign opportunistically since 1090 hadn't supplied
+        # one yet (DF11 squitter carries no callsign).
+        self.assertEqual(ac.callsign, "BAW217")
+
+    def test_per_receiver_vdl2_counter(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        eng = self._engine()
+        for fixture in ("cpdlc_uplink.json", "acars_posrep.json"):
+            eng.feed_vdl2(parse_vdl2_line(_load_fixture(fixture), "rx-vdl2"))
+        rx = eng.receivers.get("rx-vdl2")
+        self.assertIsNotNone(rx)
+        self.assertEqual(rx.vdl2_frames_total, 2)
+        self.assertEqual(eng.total_vdl2_frames, 2)
+
+    def test_snapshot_stats_exposes_vdl2(self):
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        eng = self._engine()
+        eng.feed_vdl2(parse_vdl2_line(_load_fixture("cpdlc_uplink.json"), "rx1"))
+        snap = eng.snapshot()
+        self.assertIn("total_vdl2_frames", snap["stats"])
+        self.assertEqual(snap["stats"]["total_vdl2_frames"], 1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# VDL2 in distributed (edge ↔ central) deployments.
+#
+# These tests cover gaps the audit found: edge --vdl2 wiring, the
+# DELTA_TYPE_COMMS envelope, and the central merger's dedup between
+# the dedicated comms delta and the comms list embedded in
+# DELTA_TYPE_AIRCRAFT.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestEdgeVdl2Wiring(unittest.TestCase):
+    """EdgeRunner gains an optional vdl2_host/vdl2_port and a
+    DELTA_TYPE_COMMS-emitting hook into the engine."""
+
+    def _capture_transport(self):
+        from skywatch.transport import Transport
+        class CaptureTransport(Transport):
+            def __init__(self):
+                self.deltas = []
+            def start(self): pass
+            def stop(self): pass
+            def send(self, d): self.deltas.append(d); return True
+            def subscribe(self, cb): pass
+        return CaptureTransport()
+
+    def test_vdl2_optional_no_thread_when_omitted(self):
+        """Without --vdl2, the runner does not spin up a VDL2 thread
+        and behaves identically to the BEAST-only edge it always was."""
+        from skywatch.edge.runner import EdgeRunner
+        cap = self._capture_transport()
+        runner = EdgeRunner(
+            receiver_id="rx-edge", beast_host="unused", beast_port=0,
+            transport=cap,
+        )
+        # No vdl2 args supplied → no vdl2 thread on start().  We don't
+        # call start() here (avoids real network), but the attributes
+        # should reflect the absence.
+        self.assertIsNone(runner.vdl2_host)
+        self.assertIsNone(runner.vdl2_port)
+        # Hook is registered unconditionally — that's harmless when no
+        # frames ever arrive — but the constructor should leave the
+        # vdl2 thread slot empty until start() decides.
+        self.assertIsNone(runner._vdl2_thread)
+
+    def test_edge_runner_ships_comms_delta(self):
+        """One VDL2 frame fed into the engine produces three deltas
+        on the wire: COMMS (dedicated archive), AIRCRAFT (state with
+        embedded comms list), and EVENT (ticker)."""
+        from skywatch.decoder.vdl2 import parse_vdl2_line
+        from skywatch.edge.runner import EdgeRunner
+        from skywatch.transport import (
+            DELTA_TYPE_AIRCRAFT, DELTA_TYPE_COMMS, DELTA_TYPE_EVENT,
+        )
+        cap = self._capture_transport()
+        runner = EdgeRunner(
+            receiver_id="rx-edge", beast_host="unused", beast_port=0,
+            transport=cap,
+        )
+        frame = parse_vdl2_line(_load_fixture("cpdlc_uplink.json"),
+                                receiver_id="rx-edge")
+        self.assertIsNotNone(frame)
+        runner.engine.feed_vdl2(frame)
+        kinds = [d.type for d in cap.deltas]
+        self.assertIn(DELTA_TYPE_COMMS, kinds)
+        self.assertIn(DELTA_TYPE_AIRCRAFT, kinds)
+        self.assertIn(DELTA_TYPE_EVENT, kinds)
+        # Comms delta payload should carry the aircraft icao and the
+        # raw line so the central can re-archive without parsing.
+        comms = next(d for d in cap.deltas if d.type == DELTA_TYPE_COMMS)
+        self.assertEqual(comms.payload["aircraft_icao"], "4CA8D5")
+        self.assertEqual(comms.payload["kind"], "cpdlc")
+        self.assertIn("CLIMB TO FL360", comms.payload["text"] or "")
+        self.assertTrue(comms.payload["raw"])
+
+
+class TestCentralMergerComms(unittest.TestCase):
+    """Central handles the new DELTA_TYPE_COMMS envelope and dedups
+    against the comms list embedded in DELTA_TYPE_AIRCRAFT."""
+
+    def _bind_merger(self, store=None):
+        from skywatch.central.merger import CentralMerger
+        from skywatch.state import StateEngine
+        eng = StateEngine(store=store)
+        return CentralMerger(eng), eng
+
+    def test_apply_comms_persists_to_store(self):
+        """When the central has a Mongo store, every comms delta calls
+        enqueue_comms with attribute-access on a VdlFrame-shaped doc."""
+        from skywatch.transport import Delta, DELTA_TYPE_COMMS
+        captured = []
+        class StubStore:
+            def enqueue_comms(self, frame):
+                captured.append(frame)
+            def upsert_aircraft(self, *a, **kw): pass
+            def log_event(self, *a, **kw): pass
+        m, _ = self._bind_merger(store=StubStore())
+        d = Delta(DELTA_TYPE_COMMS, "rx-edge", 1, {
+            "ts": 1234.5,
+            "aircraft_icao": "4CA8D5",
+            "src_icao": None, "dst_icao": "4CA8D5",
+            "direction": "uplink", "kind": "cpdlc",
+            "label": "CPDLC", "text": "CLIMB TO FL360",
+            "flight": None, "reg": None,
+            "raw": '{"vdl2":{}}',
+        })
+        m.apply_delta(d)
+        self.assertEqual(len(captured), 1)
+        f = captured[0]
+        self.assertEqual(f.aircraft_icao, "4CA8D5")
+        self.assertEqual(f.receiver_id, "rx-edge")  # taken from delta, not payload
+        self.assertEqual(f.kind, "cpdlc")
+        self.assertEqual(f.text, "CLIMB TO FL360")
+
+    def test_apply_comms_appends_to_aircraft_comms(self):
+        """Comms delta with an aircraft_icao adds an entry to
+        Aircraft.comms (creating the Aircraft on sight if needed)."""
+        from skywatch.transport import Delta, DELTA_TYPE_COMMS
+        m, eng = self._bind_merger()
+        m.apply_delta(Delta(DELTA_TYPE_COMMS, "rx-edge", 1, {
+            "ts": 100.0, "aircraft_icao": "ABCDEF",
+            "kind": "cpdlc", "label": "CPDLC", "text": "MAINTAIN FL340",
+            "direction": "uplink", "src_icao": None, "dst_icao": "ABCDEF",
+        }))
+        ac = eng.aircraft.get("ABCDEF")
+        self.assertIsNotNone(ac)
+        self.assertEqual(len(ac.comms), 1)
+        self.assertEqual(ac.comms[0]["text"], "MAINTAIN FL340")
+
+    def test_aircraft_comms_dedup_against_comms_delta(self):
+        """When the same logical message arrives via both
+        DELTA_TYPE_COMMS and embedded inside DELTA_TYPE_AIRCRAFT, the
+        merger keeps a single deque entry — independent of arrival
+        order."""
+        from skywatch.transport import (
+            Delta, DELTA_TYPE_AIRCRAFT, DELTA_TYPE_COMMS,
+        )
+        m, eng = self._bind_merger()
+        comms_payload = {
+            "ts": 100.0, "aircraft_icao": "ABCDEF",
+            "kind": "cpdlc", "label": "CPDLC",
+            "text": "CLIMB TO FL360",
+            "direction": "uplink", "dst_icao": "ABCDEF",
+        }
+        embedded = {
+            "ts": 100.0, "kind": "cpdlc", "label": "CPDLC",
+            "text": "CLIMB TO FL360", "direction": "uplink",
+        }
+        # Order 1: dedicated comms delta first, then aircraft delta.
+        m.apply_delta(Delta(DELTA_TYPE_COMMS, "rx-edge", 1, comms_payload))
+        m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx-edge", 2, {
+            "icao": "ABCDEF", "comms": [embedded],
+        }))
+        ac = eng.aircraft["ABCDEF"]
+        self.assertEqual(len(ac.comms), 1)
+        # Order 2: reversed — same outcome.
+        eng.aircraft.clear()
+        m.apply_delta(Delta(DELTA_TYPE_AIRCRAFT, "rx-edge", 3, {
+            "icao": "FEDCBA", "comms": [embedded],
+        }))
+        m.apply_delta(Delta(DELTA_TYPE_COMMS, "rx-edge", 4, dict(
+            comms_payload, aircraft_icao="FEDCBA")))
+        ac2 = eng.aircraft["FEDCBA"]
+        self.assertEqual(len(ac2.comms), 1)
+
+
+class TestPiFeederComposeSkywatchCommand(unittest.TestCase):
+    """The pi-feeder skywatch service must invoke `--vdl2` so the
+    docker stack populates the comms collection without operator
+    intervention.  Pure text scan — avoids a yaml dep in tests."""
+
+    def test_skywatch_command_includes_vdl2(self):
+        import os as _os
+        compose_path = _os.path.join(
+            _os.path.dirname(__file__), "..", "pi-feeder", "docker-compose.yml")
+        with open(compose_path) as f:
+            text = f.read()
+        # Find the skywatch service block (between `  skywatch:` and
+        # the next top-level service, whichever comes first).
+        start = text.find("\n  skywatch:\n")
+        self.assertGreater(start, 0)
+        # Next sibling service starts with two-space indent + name.
+        end = text.find("\n  skywatch-edge:\n", start)
+        self.assertGreater(end, start)
+        block = text[start:end]
+        self.assertIn("--vdl2 vdl2:5555", block)
+        self.assertIn("--vdl2-name vdl2", block)
+
+    def test_skywatch_edge_service_present(self):
+        """Edge-mode profile exists and runs skywatch.edge with the
+        wiring documented in .env.example (name, central URL, token)."""
+        import os as _os
+        compose_path = _os.path.join(
+            _os.path.dirname(__file__), "..", "pi-feeder", "docker-compose.yml")
+        with open(compose_path) as f:
+            text = f.read()
+        start = text.find("\n  skywatch-edge:\n")
+        self.assertGreater(start, 0, "skywatch-edge service missing")
+        end = text.find("\n  vdl2:\n", start)
+        self.assertGreater(end, start)
+        block = text[start:end]
+        self.assertIn('profiles: ["skywatch-edge"]', block)
+        self.assertIn("python3 -m skywatch.edge", block)
+        self.assertIn("--beast ultrafeeder:30005", block)
+        self.assertIn("--vdl2 vdl2:5555", block)
+        self.assertIn("--transport ws", block)
+        self.assertIn("${SKYWATCH_CENTRAL_URL}", block)
+        self.assertIn("--token-env SKYWATCH_INGEST_TOKEN", block)
+        # No port mappings — edge is outbound-only.
+        self.assertNotIn("8080:8080", block)
+        self.assertNotIn("8765:8765", block)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

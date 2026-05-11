@@ -32,6 +32,9 @@ class Receiver:
     last_frame_at: float | None = None
     frames_total: int = 0
     frames_dropped: int = 0
+    # Parallel counter for VDL2 ingest (CPDLC/ACARS).  Stays at 0 when
+    # only 1090 is configured for this receiver site.
+    vdl2_frames_total: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +48,7 @@ class Receiver:
             "last_frame_at": self.last_frame_at,
             "frames_total": self.frames_total,
             "frames_dropped": self.frames_dropped,
+            "vdl2_frames_total": self.vdl2_frames_total,
         }
 
 

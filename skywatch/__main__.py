@@ -92,6 +92,33 @@ def _resolve_receivers(args) -> list[dict]:
     return out
 
 
+def _resolve_vdl2_inputs(args) -> list[dict]:
+    """Pair --vdl2 endpoints with --vdl2-name (and the existing
+    --rx-lat / --rx-lon position flags by index — VDL2 receivers
+    typically co-locate with dump1090 on the same site, so it makes
+    sense to share the position list).  Same indexing rule as
+    `_resolve_receivers`: the i-th --vdl2 pairs with the i-th
+    --vdl2-name."""
+    vdl2s = args.vdl2 or []
+    names = args.vdl2_name or []
+    lats = args.rx_lat or []
+    lons = args.rx_lon or []
+    out: list[dict] = []
+    for i, endpoint in enumerate(vdl2s):
+        host, port = _parse_endpoint(endpoint, 5555)
+        name = names[i] if i < len(names) else None
+        lat = lats[i] if i < len(lats) else None
+        lon = lons[i] if i < len(lons) else None
+        receiver_id = name or f"vdl2:{host}:{port}"
+        out.append({
+            "receiver_id": receiver_id,
+            "name": name or receiver_id,
+            "host": host, "port": port,
+            "lat": lat, "lon": lon,
+        })
+    return out
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="skywatch",
@@ -125,6 +152,22 @@ def main(argv=None) -> int:
         "--rx-range-nm", type=float, action="append", default=None,
         help="Receiver range in NM, paired positionally with --beast. "
              "Repeatable.",
+    )
+    parser.add_argument(
+        "--vdl2", metavar="HOST:PORT", action="append", default=None,
+        help="Connect to a dumpvdl2 JSON output (default port 5555). "
+             "VDL Mode 2 carries CPDLC, ACARS, and ATN messages on "
+             "~136 MHz VHF — operationally separate from 1090 MHz, so "
+             "this is a parallel ingest path that joins the same "
+             "engine state via the aircraft's ICAO-24 address. "
+             "Repeatable; pairs with --vdl2-name (and the same "
+             "--rx-lat/--rx-lon/--rx-range-nm flags as the BEAST "
+             "list, since dumpvdl2 typically co-locates with dump1090).",
+    )
+    parser.add_argument(
+        "--vdl2-name", action="append", default=None,
+        help="VDL2 receiver display name, paired positionally with "
+             "--vdl2.  Defaults to host:port.  Repeatable.",
     )
     parser.add_argument(
         "--http", metavar="HOST:PORT", default="127.0.0.1:8080",
@@ -327,6 +370,23 @@ def main(argv=None) -> int:
     else:
         log.info("No --beast specified — using synthetic message generator")
         app.start_synthetic_input(time_scale=args.time_scale)
+
+    # VDL2 receivers run alongside BEAST (operationally CPDLC/ACARS
+    # is on a different physical layer; same engine state by ICAO).
+    vdl2_specs = _resolve_vdl2_inputs(args)
+    for spec in vdl2_specs:
+        engine.receivers.upsert(
+            spec["receiver_id"],
+            name=spec["name"],
+            lat=spec["lat"], lon=spec["lon"],
+        )
+        log.info("Starting VDL2 client %r → %s:%d (%s)",
+                 spec["receiver_id"], spec["host"], spec["port"],
+                 spec["name"])
+        app.start_vdl2_client(
+            spec["host"], spec["port"],
+            receiver_id=spec["receiver_id"],
+        )
 
     print()
     print(f"  Web UI:    http://{http_host}:{http_port}/")

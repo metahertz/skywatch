@@ -20,10 +20,29 @@
     // index 0); the renderer reverses it for newest-first display.
     events: [],
     eventsMax: 500,
+    // Live ticker filter: 'all' | 'adsb' | 'vdl2'.  Persisted across
+    // reloads.  state.events still records every event regardless of
+    // the filter — this only changes which ones land in the DOM.
+    eventFilter: (() => {
+      const v = localStorage.getItem('skywatch.eventFilter');
+      return (v === 'all' || v === 'adsb' || v === 'vdl2') ? v : 'all';
+    })(),
     stats: {},
-    frameTimes: [],          // sliding window for rate calc
+    lastFrameSample: null,   // [ts_ms, total_frames] of the last stats payload
     filterText: '',
-    detailMode: localStorage.getItem('skywatch.detailMode') || 'compact',
+    // When true, the map shows ONLY the currently-selected aircraft —
+    // all other markers, trails, and TCAS links are hidden so the
+    // operator can study one target without visual noise.  Session
+    // only; not persisted.
+    isolateSelected: false,
+    // Validated against a known-good set: an earlier bug let the
+    // string "undefined" land here, which would otherwise stick on
+    // reload (truthy, but not equal to any handled mode) and pin
+    // the pane in verbose forever.
+    detailMode: (() => {
+      const v = localStorage.getItem('skywatch.detailMode');
+      return (v === 'compact' || v === 'verbose') ? v : 'compact';
+    })(),
     config: { route_enrichment: false, route_enrichment_available: false },
     // Map-marker label fields.  Persisted per-browser.  Default mirrors
     // the original (callsign + FL + V/S + GS) so existing users see no
@@ -56,6 +75,7 @@
     statRate: document.getElementById('stat-rate'),
     statDrop: document.getElementById('stat-drop'),
     statRx: document.getElementById('stat-rx'),
+    statVdl2: document.getElementById('stat-vdl2'),
     statAircraft: document.getElementById('stat-aircraft'),
     connStat: document.getElementById('conn-stat'),
   };
@@ -163,13 +183,16 @@
 
   // Detail-pane view toggle: compact vs verbose+source-provenance.
   // Choice persisted in localStorage so reloads remember it.
-  document.querySelectorAll('.detail-mode-btn').forEach(btn => {
+  // Selector is scoped to buttons with a `data-mode` attribute so it
+  // doesn't catch siblings that share the .detail-mode-btn styling
+  // (e.g. ISOLATE) — those have their own click handlers.
+  document.querySelectorAll('.detail-mode-btn[data-mode]').forEach(btn => {
     if (btn.dataset.mode === state.detailMode) btn.classList.add('active');
     btn.addEventListener('click', () => {
       if (btn.dataset.mode === state.detailMode) return;
       state.detailMode = btn.dataset.mode;
       localStorage.setItem('skywatch.detailMode', state.detailMode);
-      document.querySelectorAll('.detail-mode-btn').forEach(b =>
+      document.querySelectorAll('.detail-mode-btn[data-mode]').forEach(b =>
         b.classList.toggle('active', b.dataset.mode === state.detailMode));
       renderDetail();
     });
@@ -180,11 +203,16 @@
   const map = L.map('map', {
     center: [51.4775, -0.4614],
     zoom: 8,
-    zoomControl: true,
+    // Default zoom-control position is topleft, which collides with
+    // the legend / map-label panel.  Move to topright (the right
+    // edge of the map pane abuts the list pane, so this stays inside
+    // the map area without overlapping any other UI).
+    zoomControl: false,
     attributionControl: true,
     preferCanvas: false,
     worldCopyJump: true,
   });
+  L.control.zoom({ position: 'topright' }).addTo(map);
 
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
     attribution: '© OpenStreetMap, © CARTO',
@@ -364,6 +392,15 @@
            (stale ? ' ' + stale : '');
   }
 
+  // Map visibility predicate.  When `isolateSelected` is on, only the
+  // currently-selected aircraft renders on the map (markers, trail,
+  // and any TCAS-link line).  All other state — list, detail pane,
+  // events ticker — keeps showing every aircraft as normal.
+  function isVisibleOnMap(ac) {
+    if (!state.isolateSelected) return true;
+    return state.selectedIcao && ac.icao === state.selectedIcao;
+  }
+
   function makeMarker(ac) {
     const icon = L.divIcon({
       html: buildMarkerHtml(ac),
@@ -379,6 +416,15 @@
   function updateMarker(ac) {
     if (ac.lat == null || ac.lon == null) return;
     const existing = markers.get(ac.icao);
+    // Honour the isolate-selected toggle: aircraft that should be
+    // hidden are removed from the layer rather than just dimmed.
+    if (!isVisibleOnMap(ac)) {
+      if (existing) {
+        aircraftLayer.removeLayer(existing);
+        markers.delete(ac.icao);
+      }
+      return;
+    }
     if (existing) {
       existing.setLatLng([ac.lat, ac.lon]);
       existing.setIcon(L.divIcon({
@@ -392,12 +438,31 @@
       markers.set(ac.icao, m);
       aircraftLayer.addLayer(m);
     }
+    followIfIsolated(ac);
+  }
+
+  // Follow-mode: when ISOLATE is active and this update is for the
+  // selected aircraft, pan the map to keep it on-screen.  Zoom level
+  // is preserved.  Animation is short so a stream of updates feels
+  // smooth rather than jerky.
+  function followIfIsolated(ac) {
+    if (!state.isolateSelected) return;
+    if (!state.selectedIcao || ac.icao !== state.selectedIcao) return;
+    if (ac.lat == null || ac.lon == null) return;
+    map.panTo([ac.lat, ac.lon], { animate: true, duration: 0.4 });
   }
 
   function updateTrail(ac) {
+    const existing = trails.get(ac.icao);
+    if (!isVisibleOnMap(ac)) {
+      if (existing) {
+        trailLayer.removeLayer(existing);
+        trails.delete(ac.icao);
+      }
+      return;
+    }
     if (!ac.trail || ac.trail.length < 2) return;
     const latlngs = ac.trail.map(pt => [pt[1], pt[2]]);
-    const existing = trails.get(ac.icao);
     if (existing) {
       existing.setLatLngs(latlngs);
     } else {
@@ -430,6 +495,11 @@
       const a = ac;
       const b = state.aircraft.get(ac.tcas_threat_icao);
       if (!b || a.lat == null || b.lat == null) continue;
+      // In isolate mode, only render a TCAS link if the selected
+      // aircraft is one of the two ends.
+      if (state.isolateSelected &&
+          a.icao !== state.selectedIcao &&
+          b.icao !== state.selectedIcao) continue;
       const key = [icao, ac.tcas_threat_icao].sort().join('-');
       if (seen.has(key)) continue;
       seen.add(key);
@@ -522,6 +592,19 @@
       cls += ' ev-intent';
       const src = ev.source ? ` [${ev.source}]` : '';
       msg = `${ev.summary || ''}${src}`;
+    } else if (ev.type === 'cpdlc_msg') {
+      cls += ' ev-cpdlc';
+      const arrow = ev.direction === 'uplink' ? '▲' :
+                    ev.direction === 'downlink' ? '▼' : '◆';
+      msg = `CPDLC ${arrow} ${ev.summary || ''}`;
+    } else if (ev.type === 'acars_msg') {
+      cls += ' ev-acars';
+      const arrow = ev.direction === 'uplink' ? '▲' :
+                    ev.direction === 'downlink' ? '▼' : '◆';
+      msg = `ACARS ${arrow} ${ev.label || ''} · ${ev.summary || ''}`;
+    } else if (ev.type === 'vdl2_link') {
+      cls += ' ev-vdl2';
+      msg = `VDL2 · ${ev.summary || ''}`;
     } else {
       msg = ev.summary || ev.type || JSON.stringify(ev);
     }
@@ -546,6 +629,101 @@
       <div class="detail-section">
         <h4>EVENTS <span class="ev-count">${matches.length}</span></h4>
         <div class="ev-list">${rows}</div>
+      </div>`;
+  }
+
+  // ACARS H1 wind/temperature grid heuristic.
+  //
+  // Many airlines downlink periodic wind/temperature observations
+  // along the route as ACARS H1 (free-text AOC) messages.  The body
+  // is airline-proprietary but follows a recognisable pattern:
+  // sequences of "+<offset> <a> <b> <c> <d>-<altitude> <±N>DC" rows
+  // separated by whitespace.  When we see ≥ 2 of these rows, render
+  // the body as a small table instead of a wrapped run-on string.
+  //
+  // The columns are airline-dependent — typical pairs are wind
+  // direction/speed and aircraft heading/track — but we don't try
+  // to label them beyond "p1..p4" because the meaning varies and
+  // mis-labelling would be worse than not labelling.
+  const _H1_ROW_RE = /\+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)-(\d+)\s+([+-]?\d+)DC/g;
+  function tryParseH1Wind(text) {
+    if (!text) return null;
+    const rows = [];
+    let m;
+    _H1_ROW_RE.lastIndex = 0;
+    while ((m = _H1_ROW_RE.exec(text)) !== null) {
+      rows.push({
+        offset: m[1], p1: m[2], p2: m[3], p3: m[4], p4: m[5],
+        alt: m[6], temp: m[7],
+      });
+    }
+    return rows.length >= 2 ? rows : null;
+  }
+
+  function renderH1WindTable(rows) {
+    const fmtAlt = a => 'FL' + String(Math.round(parseInt(a, 10) / 100)).padStart(3, '0');
+    const body = rows.map(r =>
+      `<tr>
+        <td>+${r.offset}</td>
+        <td>${r.p1}</td><td>${r.p2}</td>
+        <td>${r.p3}</td><td>${r.p4}</td>
+        <td class="alt">${fmtAlt(r.alt)}</td>
+        <td class="sat">${parseInt(r.temp, 10)}°C</td>
+      </tr>`).join('');
+    return `
+      <table class="h1-wind-table">
+        <thead><tr>
+          <th>Δ</th><th>p1</th><th>p2</th><th>p3</th><th>p4</th>
+          <th>FL</th><th>SAT</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>`;
+  }
+
+  // COMMS block — VDL2 / CPDLC / ACARS messages exchanged with this
+  // aircraft.  Renders only when the aircraft has comms data; nothing
+  // shown for receive-only-1090 deployments.  Newest-first.
+  function commsBlock(ac) {
+    const list = ac.comms || [];
+    if (!list.length) return '';
+    const rows = list.slice().reverse().map(c => {
+      const t = new Date((c.ts || Date.now() / 1000) * 1000)
+        .toISOString().substr(11, 8);
+      const arrow = c.direction === 'uplink' ? '▲' :
+                    c.direction === 'downlink' ? '▼' : '◆';
+      const cls = 'comms-row comms-' + (c.kind || 'other');
+      const label = c.label ? `<span class="c-label">${c.label}</span>` : '';
+      // Block-count indicator for reassembled multi-block ACARS
+      // messages.  "n parts" if >1; nothing if single-block.
+      const blockBadge = (c.blocks && c.blocks > 1)
+        ? ` <span class="c-blocks" title="Reassembled from ${c.blocks} ACARS blocks${c.complete === false ? ' (more pending)' : ''}">×${c.blocks}${c.complete === false ? '…' : ''}</span>`
+        : '';
+      // H1 wind/temp heuristic — when the body matches the regular
+      // wind-aloft pattern, render a small table.  Otherwise show
+      // the raw text as before.
+      let bodyHtml = '';
+      if (c.kind === 'acars' && c.label === 'H1') {
+        const wind = tryParseH1Wind(c.text);
+        if (wind) {
+          bodyHtml = renderH1WindTable(wind);
+        }
+      }
+      if (!bodyHtml) {
+        bodyHtml = c.text
+          ? `<span class="c-text">${c.text}</span>`
+          : '';
+      }
+      return `<div class="${cls}">
+        <span class="c-t">${t}</span>
+        <span class="c-arrow">${arrow}</span>
+        ${label}${blockBadge}
+        ${bodyHtml}
+      </div>`;
+    }).join('');
+    return `
+      <div class="detail-section">
+        <h4>COMMS <span class="c-count">${list.length}</span></h4>
+        <div class="comms-list">${rows}</div>
       </div>`;
   }
 
@@ -827,6 +1005,7 @@
       </div>
 
       ${receiversBlock(ac)}
+      ${commsBlock(ac)}
       ${aircraftEventsBlock(ac)}
     `;
   }
@@ -969,6 +1148,7 @@
       </div>
 
       ${receiversBlock(ac)}
+      ${commsBlock(ac)}
       ${aircraftEventsBlock(ac)}
 
       <div class="detail-section detail-footer">
@@ -982,20 +1162,77 @@
     state.selectedIcao = icao;
     renderList();
     renderDetail();
-    // Mark on map
-    for (const [k, m] of markers) {
-      const ac = state.aircraft.get(k);
-      if (ac) updateMarker(ac);
+    refreshIsolateButton();
+    // Re-evaluate every aircraft's marker.  Iterates state.aircraft
+    // (not just the existing markers map) so that turning the
+    // selection ON while in isolate mode adds the newly-selected
+    // aircraft back even if it had been removed.
+    for (const ac of state.aircraft.values()) {
+      updateMarker(ac);
+      updateTrail(ac);
     }
+    updateTcasLinks();
     const ac = state.aircraft.get(icao);
     if (ac && ac.lat != null && ac.lon != null) {
       map.panTo([ac.lat, ac.lon], { animate: true, duration: 0.5 });
     }
   }
 
+  // ─── Isolate-selected toggle ────────────────────────────────────────
+  // Hides every aircraft on the map except the currently-selected one.
+  // List + detail pane + ticker stay normal; this is purely a map-clutter
+  // reducer.
+  const isolateBtn = document.getElementById('isolate-btn');
+
+  function refreshIsolateButton() {
+    isolateBtn.disabled = !state.selectedIcao;
+    isolateBtn.classList.toggle('active', state.isolateSelected);
+  }
+
+  isolateBtn.addEventListener('click', () => {
+    if (!state.selectedIcao) return;
+    state.isolateSelected = !state.isolateSelected;
+    refreshIsolateButton();
+    // Walk every aircraft so markers/trails come or go to match the
+    // new mode.  Cheap: bounded by len(aircraft) ≤ ~1000.
+    for (const ac of state.aircraft.values()) {
+      updateMarker(ac);
+      updateTrail(ac);
+    }
+    updateTcasLinks();
+    // Immediately re-centre on the isolated aircraft so the user
+    // doesn't have to wait for the next position update for follow
+    // mode to kick in.
+    if (state.isolateSelected) {
+      const ac = state.aircraft.get(state.selectedIcao);
+      if (ac) followIfIsolated(ac);
+    }
+  });
+  refreshIsolateButton();
+
   // ─── Event log ──────────────────────────────────────────────────────
 
-  function pushEvent(ev) {
+  // Event-type families.  ADSB family is everything sourced from the
+  // 1090 MHz ingest path (TCAS RA, intent change, emergency, new
+  // contacts).  VDL2 family is everything from the 136 MHz ingest
+  // path (CPDLC, ACARS, link mgmt).  Anything not classified as VDL2
+  // is treated as ADSB so that future engine event types appear in
+  // the default-on ADSB filter rather than vanishing.
+  const _VDL2_EVENT_TYPES = new Set([
+    'cpdlc_msg', 'acars_msg', 'vdl2_link', 'vdl2_msg',
+  ]);
+  function eventFamily(ev) {
+    return _VDL2_EVENT_TYPES.has(ev && ev.type) ? 'vdl2' : 'adsb';
+  }
+  function eventPassesFilter(ev) {
+    if (state.eventFilter === 'all') return true;
+    return eventFamily(ev) === state.eventFilter;
+  }
+
+  // Build the <li> for one event.  Extracted so applyEventFilter()
+  // can rebuild the whole ticker DOM from `state.events` without
+  // duplicating the per-type rendering logic.
+  function buildEventLi(ev) {
     const li = document.createElement('li');
     const t = new Date((ev.t || Date.now()/1000) * 1000)
       .toISOString().substr(11, 8);
@@ -1008,28 +1245,9 @@
       msg = `RA ${ev.callsign || ev.icao}: ${ev.summary}` +
             (ev.threat_icao ? ` (threat ${ev.threat_icao})` : '') +
             ` [${ev.source}]`;
-      // Also push to RA timeline
-      state.raEvents.push({
-        icao: ev.icao,
-        callsign: ev.callsign,
-        started_at: ev.t,
-        summary: ev.summary,
-        threat_icao: ev.threat_icao,
-        source: ev.source,
-        ended_at: null,
-      });
-      renderRaTimeline();
     } else if (ev.type === 'tcas_ra_ended') {
       cls = 'ev-tcas';
       msg = `RA END ${ev.icao}: ${ev.summary || ''}`;
-      // Mark the latest matching RA as ended
-      for (let i = state.raEvents.length - 1; i >= 0; i--) {
-        if (state.raEvents[i].icao === ev.icao && state.raEvents[i].ended_at == null) {
-          state.raEvents[i].ended_at = ev.t;
-          break;
-        }
-      }
-      renderRaTimeline();
     } else if (ev.type === 'emergency') {
       cls = 'ev-emerg';
       msg = `EMERGENCY ${ev.icao}: ${ev.state}`;
@@ -1038,6 +1256,21 @@
       const who = ev.callsign || ev.icao;
       const src = ev.source ? ` <span class="ev-src">[${ev.source}]</span>` : '';
       msg = `${who} · ${ev.summary || ''}${src}`;
+    } else if (ev.type === 'cpdlc_msg') {
+      cls = 'ev-cpdlc';
+      const who = ev.callsign || ev.icao || '?';
+      const arrow = ev.direction === 'uplink' ? '▲' :
+                    ev.direction === 'downlink' ? '▼' : '◆';
+      msg = `${who} CPDLC ${arrow} ${ev.summary || ''}`;
+    } else if (ev.type === 'acars_msg') {
+      cls = 'ev-acars';
+      const who = ev.callsign || ev.icao || '?';
+      const arrow = ev.direction === 'uplink' ? '▲' :
+                    ev.direction === 'downlink' ? '▼' : '◆';
+      msg = `${who} ACARS ${arrow} ${ev.label || ''} · ${ev.summary || ''}`;
+    } else if (ev.type === 'vdl2_link') {
+      cls = 'ev-vdl2';
+      msg = `${ev.icao || '?'} VDL2 · ${ev.summary || ''}`;
     } else {
       msg = JSON.stringify(ev);
     }
@@ -1050,12 +1283,35 @@
     }
     li.className = cls;
     li.innerHTML = `<span class="ev-t">${t}</span><span class="ev-msg">${msg}</span>`;
-    el.eventLog.insertBefore(li, el.eventLog.firstChild);
-    while (el.eventLog.children.length > 200) {
-      el.eventLog.removeChild(el.eventLog.lastChild);
+    return li;
+  }
+
+  function pushEvent(ev) {
+    // ── Side effects (always happen, regardless of filter) ─────────
+    // RA-timeline mutations.
+    if (ev.type === 'tcas_ra_started') {
+      state.raEvents.push({
+        icao: ev.icao,
+        callsign: ev.callsign,
+        started_at: ev.t,
+        summary: ev.summary,
+        threat_icao: ev.threat_icao,
+        source: ev.source,
+        ended_at: null,
+      });
+      renderRaTimeline();
+    } else if (ev.type === 'tcas_ra_ended') {
+      for (let i = state.raEvents.length - 1; i >= 0; i--) {
+        if (state.raEvents[i].icao === ev.icao && state.raEvents[i].ended_at == null) {
+          state.raEvents[i].ended_at = ev.t;
+          break;
+        }
+      }
+      renderRaTimeline();
     }
-    // Mirror into state.events so the per-aircraft EVENTS block in the
-    // detail pane can filter by ICAO.  Trim to the configured cap.
+    // Mirror into state.events so the per-aircraft EVENTS block in
+    // the detail pane and the live ticker filter both see every
+    // event.  Trim to the configured cap.
     state.events.push(ev);
     if (state.events.length > state.eventsMax) {
       state.events.splice(0, state.events.length - state.eventsMax);
@@ -1069,7 +1325,49 @@
           ev.threat_icao === state.selectedIcao)) {
       renderDetail();
     }
+
+    // ── Live ticker DOM insert (gated on the current filter) ───────
+    if (!eventPassesFilter(ev)) return;
+    const li = buildEventLi(ev);
+    el.eventLog.insertBefore(li, el.eventLog.firstChild);
+    while (el.eventLog.children.length > 200) {
+      el.eventLog.removeChild(el.eventLog.lastChild);
+    }
   }
+
+  // Re-render the ticker DOM from scratch using the current filter.
+  // Called by the filter buttons; cheap because state.events is
+  // capped at eventsMax (500).
+  function applyEventFilter() {
+    el.eventLog.innerHTML = '';
+    // state.events is oldest-first; we want newest-first DOM order
+    // (insertBefore-firstChild semantics), so iterate in reverse and
+    // append to the end.
+    for (let i = state.events.length - 1; i >= 0; i--) {
+      const ev = state.events[i];
+      if (!eventPassesFilter(ev)) continue;
+      const li = buildEventLi(ev);
+      el.eventLog.appendChild(li);
+      if (el.eventLog.children.length >= 200) break;
+    }
+    // Update button active states.
+    document.querySelectorAll('#event-filter .ev-filter-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.filter === state.eventFilter);
+    });
+  }
+
+  // Wire up the filter buttons.
+  document.querySelectorAll('#event-filter .ev-filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const next = btn.dataset.filter;
+      if (next !== state.eventFilter) {
+        state.eventFilter = next;
+        localStorage.setItem('skywatch.eventFilter', next);
+        applyEventFilter();
+      }
+    });
+  });
+  applyEventFilter();   // sync initial button state
 
   // ─── RA timeline ────────────────────────────────────────────────────
 
@@ -1120,20 +1418,30 @@
     el.statFrames.textContent = (s.total_frames || 0).toLocaleString();
     el.statDrop.textContent = s.frames_dropped || 0;
     el.statAircraft.textContent = s.active_aircraft || 0;
+    // VDL2 stat: only visible after the first VDL2 frame so single-1090
+    // installs don't see a perma-zero counter.
+    const vdl2 = s.total_vdl2_frames || 0;
+    if (vdl2 > 0) {
+      el.statVdl2.hidden = false;
+      el.statVdl2.querySelector('.val').textContent = vdl2.toLocaleString();
+    }
 
-    // Frame rate over the last 5s
+    // Frame rate.  Stats payloads only arrive on the snapshot
+    // cadence (default 10 s), so a sliding-window average over a
+    // shorter span never accumulates two samples.  Compute from the
+    // delta against the previous sample directly — works at any
+    // cadence, just gives a coarser number than per-frame rates.
     const now = Date.now();
-    state.frameTimes.push([now, s.total_frames || 0]);
-    while (state.frameTimes.length > 0 && now - state.frameTimes[0][0] > 5000) {
-      state.frameTimes.shift();
+    const total = s.total_frames || 0;
+    if (state.lastFrameSample) {
+      const [t0, f0] = state.lastFrameSample;
+      const dt = (now - t0) / 1000;
+      if (dt > 0) {
+        const rate = Math.round((total - f0) / dt);
+        el.statRate.textContent = `${rate}/s`;
+      }
     }
-    if (state.frameTimes.length >= 2) {
-      const [t0, f0] = state.frameTimes[0];
-      const [tn, fn] = state.frameTimes[state.frameTimes.length - 1];
-      const dt = (tn - t0) / 1000;
-      const rate = dt > 0 ? Math.round((fn - f0) / dt) : 0;
-      el.statRate.textContent = `${rate}/s`;
-    }
+    state.lastFrameSample = [now, total];
   }
 
   function updateRxInfo(rx) {

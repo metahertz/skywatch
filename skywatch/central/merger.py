@@ -34,8 +34,8 @@ from typing import Callable
 from skywatch.state import StateEngine
 from skywatch.state.aircraft import Aircraft, ReceiverAttribution
 from skywatch.transport import (
-    DELTA_TYPE_AIRCRAFT, DELTA_TYPE_EVENT, DELTA_TYPE_METRICS,
-    DELTA_TYPE_RECEIVER, Delta,
+    DELTA_TYPE_AIRCRAFT, DELTA_TYPE_COMMS, DELTA_TYPE_EVENT,
+    DELTA_TYPE_METRICS, DELTA_TYPE_RECEIVER, Delta,
 )
 
 log = logging.getLogger("skywatch.central.merger")
@@ -72,6 +72,8 @@ class CentralMerger:
                 self._apply_aircraft(delta)
             elif delta.type == DELTA_TYPE_EVENT:
                 self._apply_event(delta)
+            elif delta.type == DELTA_TYPE_COMMS:
+                self._apply_comms(delta)
             elif delta.type == DELTA_TYPE_RECEIVER:
                 self._apply_receiver(delta)
             elif delta.type == DELTA_TYPE_METRICS:
@@ -191,6 +193,15 @@ class CentralMerger:
                 if pt[0] > existing_max_t:
                     ac.trail.append(tuple(pt))
 
+        # Comms: append any new entries the edge embedded in the
+        # aircraft payload, with dedup against entries already added
+        # via DELTA_TYPE_COMMS.  Either ordering of arrivals (embedded
+        # first OR dedicated comms delta first) converges on the same
+        # deque content.  The deque's maxlen=50 caps growth.
+        for c in (payload.get("comms") or []):
+            if isinstance(c, dict) and not _comms_dup(ac.comms, c):
+                ac.comms.append(c)
+
         # Info / route from edge — adopt as-is when supplied.
         if payload.get("info"):
             ac.db_info = _DictAsAttr(payload["info"])
@@ -234,6 +245,56 @@ class CentralMerger:
         # Engine._log_event handles persistence + listener fanout.
         self.engine._log_event(ev)
 
+    def _apply_comms(self, delta: Delta) -> None:
+        """One DELTA_TYPE_COMMS envelope from an edge.
+
+        Two responsibilities:
+          1. Persist to the dedicated `comms` time-series collection
+             (only when the central has Mongo configured).  The
+             aircraft delta carries an embedded `comms` list too, but
+             that lives inside the aircraft_state collection — the
+             dedicated `comms` archive (with TTL, time-series indexes,
+             per-kind queries) only gets populated by this path.
+          2. Append the entry to the matching Aircraft.comms deque
+             with dedup against any embedded entry the aircraft delta
+             may have already added.  This makes the central's
+             behaviour identical to monolithic mode: the detail-pane
+             COMMS section is populated whether the embedded list or
+             the dedicated delta arrives first.
+        """
+        payload = delta.payload or {}
+        # Persist to the dedicated `comms` collection.  MongoStore
+        # accesses attributes (not dict keys), so wrap in a tiny shim.
+        if self.engine.store is not None:
+            self.engine.store.enqueue_comms(_CommsShim(payload, delta.receiver_id))
+        # Attach to the aircraft's comms deque, when there is one.
+        icao = payload.get("aircraft_icao")
+        if not icao:
+            return
+        ac = self.engine.aircraft.get(icao)
+        if ac is None:
+            # Comms can arrive before the first aircraft delta for a
+            # newly-tracked ICAO.  Create an Aircraft on sight so the
+            # COMMS row isn't lost; subsequent aircraft deltas merge in.
+            ac = Aircraft(icao=icao)
+            self.engine.aircraft[icao] = ac
+        entry = {
+            "ts": payload.get("ts"),
+            "kind": payload.get("kind"),
+            "direction": payload.get("direction"),
+            "label": payload.get("label"),
+            "text": payload.get("text"),
+            "peer": (payload.get("dst_icao")
+                     if payload.get("direction") == "downlink"
+                     else payload.get("src_icao")),
+            "receiver_id": delta.receiver_id,
+            "flight": payload.get("flight"),
+            "blocks": 1,
+            "complete": True,
+        }
+        if not _comms_dup(ac.comms, entry):
+            ac.comms.append(entry)
+
     def _apply_receiver(self, delta: Delta) -> None:
         rx_doc = delta.payload or {}
         rid = rx_doc.get("id") or delta.receiver_id
@@ -254,6 +315,45 @@ class CentralMerger:
                     setattr(rx, k, rx_doc[k])
         if self.engine.store is not None and rx is not None:
             self.engine.store.upsert_receiver(rx.to_dict())
+
+
+def _comms_dup(deque_, entry: dict) -> bool:
+    """True if `entry` is already in the deque (matched on the
+    operationally-distinguishing fields).  ts is float-compared
+    exactly because both delta paths originate from the same edge
+    with the same `frame.ts` value, so equality is reliable."""
+    key = (entry.get("ts"), entry.get("kind"),
+           entry.get("label"), entry.get("text"))
+    for existing in deque_:
+        ek = (existing.get("ts"), existing.get("kind"),
+              existing.get("label"), existing.get("text"))
+        if ek == key:
+            return True
+    return False
+
+
+class _CommsShim:
+    """Adapter that lets `MongoStore.enqueue_comms()` (which expects
+    attribute access on a VdlFrame) consume a comms-delta payload dict
+    directly.  Avoids re-importing the VdlFrame dataclass into the
+    central, which lives a few packages away from the decoder."""
+    __slots__ = ("ts", "receiver_id", "aircraft_icao", "src_icao",
+                 "dst_icao", "direction", "kind", "label", "text",
+                 "flight", "reg", "raw")
+
+    def __init__(self, payload: dict, receiver_id: str):
+        self.ts = payload.get("ts")
+        self.receiver_id = receiver_id
+        self.aircraft_icao = payload.get("aircraft_icao")
+        self.src_icao = payload.get("src_icao")
+        self.dst_icao = payload.get("dst_icao")
+        self.direction = payload.get("direction")
+        self.kind = payload.get("kind")
+        self.label = payload.get("label")
+        self.text = payload.get("text")
+        self.flight = payload.get("flight")
+        self.reg = payload.get("reg")
+        self.raw = payload.get("raw")
 
 
 class _DictAsAttr:
