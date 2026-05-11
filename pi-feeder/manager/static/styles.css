@@ -1,0 +1,218 @@
+/* pi-feeder manager styling — deliberately plain and dense.  Same
+ * "thin lines on dark, phosphor-green" palette as the Skywatch UI
+ * so the two read as siblings, but no fancy effects (this thing
+ * runs on a Pi and is admin-grade UI). */
+
+:root {
+  --bg-deep:   #06090a;
+  --bg-pane:   #0b1113;
+  --bg-cell:   #0f1719;
+  --bg-active: #1a2c30;
+  --fg:        #b8f5d0;
+  --fg-bright: #e0ffec;
+  --fg-dim:    #6a8a82;
+  --fg-faint:  #3d5854;
+  --amber:     #f5b83d;
+  --amber-bright: #ffd070;
+  --red:       #ff4848;
+  --green:     #79ddc1;
+  --hairline:  1px solid rgba(120, 200, 200, 0.15);
+  --font-mono: "JetBrains Mono", "Menlo", "Consolas", monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  background: var(--bg-deep);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.45;
+  min-height: 100%;
+}
+
+body {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+header {
+  border-bottom: var(--hairline);
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+}
+header h1 {
+  color: var(--fg-bright);
+  font-size: 22px;
+  letter-spacing: 0.18em;
+  font-weight: 600;
+}
+header .sub {
+  color: var(--fg-dim);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.card {
+  background: var(--bg-pane);
+  border: var(--hairline);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.card h2 {
+  color: var(--amber);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px 14px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  letter-spacing: 0.05em;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"] {
+  background: var(--bg-cell);
+  color: var(--fg-bright);
+  border: var(--hairline);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 6px;
+  outline: none;
+}
+input:focus { border-color: var(--amber); }
+
+.hint, .help {
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  margin-top: 8px;
+  line-height: 1.4;
+}
+small {
+  color: var(--fg-faint);
+  font-size: 10px;
+}
+code {
+  background: var(--bg-cell);
+  color: var(--fg-bright);
+  padding: 0 4px;
+  font-size: 11px;
+  border: 1px solid rgba(120, 200, 200, 0.08);
+}
+
+/* Feeders list */
+.feeder {
+  border-top: var(--hairline);
+  padding: 10px 0;
+}
+.feeder:first-child {
+  border-top: none;
+  padding-top: 4px;
+}
+.feeder header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  border: none;
+  padding: 0;
+  margin: 0 0 4px 0;
+}
+.feeder .enable {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-direction: row;
+  cursor: pointer;
+}
+.feeder .feeder-name {
+  color: var(--fg-bright);
+  font-weight: 500;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+.feeder.on .feeder-name { color: var(--amber-bright); }
+.feeder input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px; height: 12px;
+  border: 1px solid rgba(120, 200, 200, 0.4);
+  background: var(--bg-cell);
+  cursor: pointer;
+}
+.feeder input[type="checkbox"]:checked {
+  background: var(--amber);
+  border-color: var(--amber);
+}
+.feeder .status {
+  font-size: 9.5px;
+  color: var(--fg-dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border: 1px solid currentColor;
+  padding: 0 5px;
+}
+.feeder .status-running { color: var(--green); }
+.feeder .status-restarting,
+.feeder .status-paused { color: var(--amber); }
+.feeder .status-exited,
+.feeder .status-dead { color: var(--red); }
+.feeder .stats-link {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-size: 10px;
+  text-decoration: none;
+  letter-spacing: 0.05em;
+}
+.feeder .stats-link:hover { color: var(--amber); }
+.feeder .field {
+  margin-top: 6px;
+  flex-direction: column;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 24px;
+}
+.actions button {
+  background: var(--amber);
+  color: var(--bg-deep);
+  border: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  padding: 8px 18px;
+  cursor: pointer;
+}
+.actions button:hover { background: var(--amber-bright); }
+.apply-hint {
+  color: var(--fg-dim);
+  font-size: 10.5px;
+}
+
+footer {
+  margin-top: 32px;
+  padding-top: 12px;
+  border-top: var(--hairline);
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+footer a { color: var(--fg); text-decoration: none; }
+footer a:hover { color: var(--amber); }

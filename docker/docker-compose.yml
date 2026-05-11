@@ -1,0 +1,76 @@
+# Docker compose for the secondary VDL Mode 2 receiver (dumpvdl2).
+#
+# Default profile uses an external `rtl_tcp` server on the host —
+# the only path that works reliably on macOS, where Docker Desktop
+# can NOT pass an RTL-SDR USB device through to the container.
+# See ./README.md for the rationale and the per-OS recipe.
+#
+# Usage:
+#   # macOS / Windows (rtl_tcp on host, dumpvdl2 in container)
+#   docker compose --profile rtltcp up --build
+#
+#   # Linux (direct USB passthrough)
+#   docker compose --profile usb up --build
+
+services:
+
+  # ─── macOS / Windows path: dumpvdl2 ← rtl_tcp on host ─────────────
+  # The container's CMD pipes raw IQ from `rtl_tcp` into dumpvdl2's
+  # stdin, skipping the 12-byte rtl_tcp protocol header.  See the
+  # Dockerfile for the exact pipeline.
+  dumpvdl2-rtltcp:
+    profiles: ["rtltcp"]
+    build: ./dumpvdl2
+    image: skywatch/dumpvdl2:latest
+    container_name: dumpvdl2
+    restart: unless-stopped
+    # `host-gateway` is a Compose magic value that maps to the
+    # docker-host IP on Linux + Docker Desktop both.  Without this
+    # mapping, plain Linux Engine doesn't resolve
+    # host.docker.internal, and even Docker Desktop occasionally
+    # resolves it to an IP the container can't route to ("Network
+    # is unreachable" from ncat).  This explicit mapping pins it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Default uses host.docker.internal (resolved via extra_hosts
+      # above).  On any host where that still fails, override with
+      # the host's actual LAN IP, e.g.
+      #   RTL_TCP_HOST=192.168.1.42 docker compose ...
+      RTL_TCP_HOST: host.docker.internal
+      RTL_TCP_PORT: "1234"
+      # Centre between 136.725 and 136.975 MHz so all five operational
+      # European VDL2 channels fit inside the 1.05 MS/s capture
+      # bandwidth.  See the Dockerfile for the channel plan.  Suitable
+      # for London FIR and any other EUROCONTROL airspace.
+      VDL2_CENTERFREQ: "136850000"
+      VDL2_FREQS: "136725000 136775000 136825000 136875000 136975000"
+      VDL2_OUT_PORT: "5555"
+    ports:
+      # Expose dumpvdl2's JSON output to the host so a native
+      # skywatch process can connect at localhost:5555.
+      - "5555:5555"
+
+  # ─── Linux path: direct USB passthrough ──────────────────────────
+  # Requires the host's RTL-SDR to appear at /dev/bus/usb.  Use
+  # `lsusb` to confirm; the device IDs vary per dongle.
+  dumpvdl2-usb:
+    profiles: ["usb"]
+    build: ./dumpvdl2
+    image: skywatch/dumpvdl2:latest
+    container_name: dumpvdl2
+    restart: unless-stopped
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    # Override the rtl_tcp default with a direct librtlsdr invocation.
+    command: >-
+      sh -c "
+        dumpvdl2
+          --rtlsdr 0
+          --gain 40
+          --output decoded:json:file:path=/dev/stdout
+          136725000 136775000 136825000 136875000 136975000
+        | ncat -l -k -p 5555 --send-only
+      "
+    ports:
+      - "5555:5555"

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pi-feeder · ADS-B / VDL2 Feeder Manager</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header>
+    <h1>pi-feeder</h1>
+    <p class="sub">ADS-B / VDL2 feeder manager for Raspberry Pi</p>
+  </header>
+
+  <form method="post" action="{{ url_for('save') }}">
+
+    <section class="card">
+      <h2>Site config</h2>
+      <div class="grid">
+        <label>Latitude
+          <input type="number" step="0.0001" name="FEEDER_LAT"
+                 value="{{ env.FEEDER_LAT or '' }}" required>
+        </label>
+        <label>Longitude
+          <input type="number" step="0.0001" name="FEEDER_LON"
+                 value="{{ env.FEEDER_LON or '' }}" required>
+        </label>
+        <label>Altitude (m)
+          <input type="number" name="FEEDER_ALT_M"
+                 value="{{ env.FEEDER_ALT_M or '' }}">
+        </label>
+        <label>Timezone
+          <input type="text" name="FEEDER_TZ"
+                 value="{{ env.FEEDER_TZ or 'UTC' }}"
+                 placeholder="e.g. Europe/London">
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>SDR configuration</h2>
+      <div class="grid">
+        <label>1090 MHz dongle serial
+          <input type="text" name="SDR_1090_SERIAL"
+                 value="{{ env.SDR_1090_SERIAL or 'rtlsdr-1090' }}">
+        </label>
+        <label>1090 MHz gain
+          <input type="text" name="SDR_1090_GAIN"
+                 value="{{ env.SDR_1090_GAIN or '40' }}">
+        </label>
+        <label>VDL2 dongle serial
+          <input type="text" name="SDR_VDL2_SERIAL"
+                 value="{{ env.SDR_VDL2_SERIAL or 'rtlsdr-vdl2' }}">
+        </label>
+        <label>VDL2 gain
+          <input type="text" name="SDR_VDL2_GAIN"
+                 value="{{ env.SDR_VDL2_GAIN or '44' }}">
+        </label>
+      </div>
+      <p class="hint">
+        Set dongle serials with <code>rtl_eeprom -d 0 -s rtlsdr-1090</code>
+        and <code>rtl_eeprom -d 1 -s rtlsdr-vdl2</code> on the host
+        before starting the feeders.  Without distinct serials,
+        containers can't address dongles individually after a
+        USB-bus reorder.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Feeders</h2>
+      {% for f in feeders %}
+      <article class="feeder {% if f.id in enabled %}on{% endif %}">
+        <header>
+          <label class="enable">
+            <input type="checkbox" name="enable_{{ f.id }}"
+                   {% if f.id in enabled %}checked{% endif %}>
+            <span class="feeder-name">{{ f.label }}</span>
+          </label>
+          <span class="status status-{{ statuses.get(f.id, 'stopped') }}">
+            {{ statuses.get(f.id, 'stopped') }}
+          </span>
+          {% if f.stats_url %}
+          <a class="stats-link" href="{{ f.stats_url }}" target="_blank"
+             rel="noopener">stats ↗</a>
+          {% endif %}
+        </header>
+        {% if f.help %}
+          <p class="help">{{ f.help }}</p>
+        {% endif %}
+        {% for fld in f.fields %}
+        <label class="field">
+          <span>{{ fld.label }}</span>
+          <input type="{{ 'password' if fld.secret else 'text' }}"
+                 name="{{ fld.key }}"
+                 value="{{ env.get(fld.key, fld.default or '') }}"
+                 {% if fld.secret %}autocomplete="off"{% endif %}>
+          {% if fld.hint %}<small>{{ fld.hint }}</small>{% endif %}
+        </label>
+        {% endfor %}
+      </article>
+      {% endfor %}
+    </section>
+
+    <div class="actions">
+      <button type="submit">Apply &amp; Restart</button>
+      <span class="apply-hint">
+        Saves the .env file and runs <code>docker compose up -d --remove-orphans</code>.
+        Disabled feeders are stopped; enabled ones are (re)created.
+      </span>
+    </div>
+
+  </form>
+
+  <footer>
+    <a href="http://{{ request.host.split(':')[0] }}/" target="_blank">tar1090 (live map)</a>
+    ·
+    <a href="http://{{ request.host.split(':')[0] }}:8080/" target="_blank">Skywatch UI</a>
+  </footer>
+</body>
+</html>

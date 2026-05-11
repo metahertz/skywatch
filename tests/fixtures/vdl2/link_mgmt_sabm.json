@@ -1,0 +1,1 @@
+{"vdl2": {"app": {"name": "dumpvdl2", "ver": "2.4.0"}, "t": {"sec": 1730000040, "usec": 500000}, "station": "home", "freq": 136975000, "avlc": {"src": {"addr": "1A2B3C", "type": "Ground station", "status": "Air/ground network station"}, "dst": {"addr": "4CA8D5", "type": "Aircraft", "status": "Airborne"}, "cr": "Command", "frame_type": "U", "cmd": "SABM", "pf": 1}}}

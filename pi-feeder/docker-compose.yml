@@ -1,0 +1,297 @@
+# pi-feeder Docker Compose stack.
+#
+# Profile-gated: services only start when their profile is in
+# COMPOSE_PROFILES.  The manager UI rewrites that env var when the
+# user enables / disables a feeder.  `ultrafeeder` and `manager` are
+# always-on (they have no `profiles:` key).
+#
+# All upstream images are arm64-capable.  Pinned to :latest with a
+# tag-policy of "rebuild monthly via cron" — bumping individual
+# pins per upgrade is more friction than this scale of project
+# warrants.
+#
+# Direct USB passthrough is used for the SDRs: each container that
+# owns a dongle gets `--device=/dev/bus/usb` and is identified by
+# the dongle's serial number set via `rtl_eeprom`.
+
+services:
+
+  # ─── Manager web UI ──────────────────────────────────────────────
+  manager:
+    build: ./manager
+    image: skywatch/pi-feeder-manager:latest
+    # `image:` here is the local tag the build produces — there is no
+    # remote registry for it.  Default compose `pull_policy: missing`
+    # tries to fetch that tag first and prints a noisy "pull access
+    # denied" before falling back to build; force build-only.
+    pull_policy: build
+    container_name: pi-feeder-manager
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      # Bind-mount the project root so the manager can read/write
+      # the .env file and run `docker compose` against the sibling
+      # services on the host.
+      - ${PI_FEEDER_DIR:-..}:/srv/pi-feeder
+      # Talk to host docker — the manager invokes `docker compose
+      # up -d` after writing the .env.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      PI_FEEDER_DIR: /srv/pi-feeder
+
+  # ─── SDR core: dump1090-fa + readsb + tar1090 + graphs1090 ──────
+  # The single point of demodulation for 1090 MHz.  Every other
+  # 1090 MHz feeder reads BEAST from this one container, so the
+  # SDR is touched exactly once.
+  ultrafeeder:
+    image: ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest
+    container_name: ultrafeeder
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "80:80"           # tar1090 web UI + graphs1090
+      - "30005:30005"     # BEAST output (consumed by skywatch and the feeders)
+      - "31003:31003"     # SBS / BaseStation output
+    environment:
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}m
+      TZ: ${FEEDER_TZ}
+      READSB_DEVICE_TYPE: rtlsdr
+      READSB_RTLSDR_DEVICE: ${SDR_1090_SERIAL}
+      READSB_GAIN: ${SDR_1090_GAIN}
+      READSB_NET_BEAST_INPUT_PORT: 30004,30104
+      READSB_NET_BEAST_REDUCE_INTERVAL: "0.5"
+    volumes:
+      - ultrafeeder_globe_history:/var/globe_history
+      - ultrafeeder_graphs1090:/var/lib/collectd
+    tmpfs:
+      - /run:exec,size=64M
+      - /var/log
+
+  # ─── Skywatch (this project) ─────────────────────────────────────
+  skywatch:
+    profiles: ["skywatch"]
+    image: skywatch/skywatch:latest
+    pull_policy: build
+    build:
+      # Built from the project root so the manager can rebuild on
+      # code changes via `docker compose build skywatch`.
+      context: ..
+      dockerfile: pi-feeder/skywatch.Dockerfile
+    container_name: skywatch
+    restart: unless-stopped
+    # `vdl2` is a profile-gated service; `depends_on` only constrains
+    # ordering, not membership.  When the operator hasn't enabled the
+    # vdl2 profile, docker compose simply ignores the dependency and
+    # the skywatch --vdl2 connect attempt fails fast / reconnects
+    # silently — no harm done.
+    depends_on: [ultrafeeder, vdl2]
+    ports:
+      - "8080:8080"     # web UI
+      - "8765:8765"     # WebSocket
+    environment:
+      SKYWATCH_LAT: ${FEEDER_LAT}
+      SKYWATCH_LON: ${FEEDER_LON}
+      SKYWATCH_TZ: ${FEEDER_TZ}
+    command: >-
+      python3 -m skywatch
+        --beast ultrafeeder:30005 --name local
+        --vdl2 vdl2:5555 --vdl2-name vdl2
+        --rx-lat ${FEEDER_LAT} --rx-lon ${FEEDER_LON}
+        --http 0.0.0.0:8080 --ws 0.0.0.0:8765
+
+  # ─── Skywatch in EDGE mode (sender to a remote central) ──────────
+  # Use this profile when the Pi only does receive/decode and pushes
+  # state to a more powerful central host (where the UI, API and
+  # Mongo archive live).  No UI is served locally — there's no port
+  # mapping for that reason.  Mutually exclusive with the `skywatch`
+  # profile above: pick one.
+  #
+  # Required .env:
+  #   SKYWATCH_EDGE_NAME      — stable receiver_id (e.g. site-a)
+  #   SKYWATCH_CENTRAL_URL    — ws://central.host:8767/ingest
+  #   SKYWATCH_INGEST_TOKEN   — bearer token issued by the central
+  skywatch-edge:
+    profiles: ["skywatch-edge"]
+    image: skywatch/skywatch:latest
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: pi-feeder/skywatch.Dockerfile
+    container_name: skywatch-edge
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    # No ports exposed — edge connects outbound to the central.
+    environment:
+      SKYWATCH_INGEST_TOKEN: ${SKYWATCH_INGEST_TOKEN}
+    # Spool path lets the edge survive a transport outage by buffering
+    # to disk; volume is host-local so it survives container recreate.
+    volumes:
+      - skywatch_edge_spool:/var/lib/skywatch
+    command: >-
+      python3 -m skywatch.edge
+        --beast ultrafeeder:30005
+        --vdl2 vdl2:5555
+        --name ${SKYWATCH_EDGE_NAME:-edge}
+        --rx-lat ${FEEDER_LAT} --rx-lon ${FEEDER_LON}
+        --transport ws
+        --central ${SKYWATCH_CENTRAL_URL}
+        --token-env SKYWATCH_INGEST_TOKEN
+        --spool /var/lib/skywatch/spool.sqlite
+
+  # ─── VDL2 (136 MHz) ──────────────────────────────────────────────
+  vdl2:
+    profiles: ["vdl2"]
+    image: skywatch/dumpvdl2:latest
+    pull_policy: build
+    build:
+      context: ../docker/dumpvdl2
+    container_name: dumpvdl2
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "5555:5555"
+    environment:
+      # Run dumpvdl2 against the second dongle directly (no rtl_tcp
+      # needed when the container has USB passthrough).
+      RTL_TCP_HOST: ""
+    command: >-
+      sh -c "
+        dumpvdl2
+          --rtlsdr 0
+          --gain ${SDR_VDL2_GAIN}
+          --output decoded:json:file:path=/dev/stdout
+          136725000 136775000 136825000 136875000 136975000
+        | ncat -l -k -p 5555 --send-only
+      "
+
+  # ─── FlightAware / PiAware ───────────────────────────────────────
+  piaware:
+    profiles: ["piaware"]
+    image: ghcr.io/sdr-enthusiasts/docker-piaware:latest
+    container_name: piaware
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      TZ: ${FEEDER_TZ}
+      FEEDER_ID: ${PIAWARE_FEEDER_ID}
+
+  # ─── FlightRadar24 ───────────────────────────────────────────────
+  fr24:
+    profiles: ["fr24"]
+    image: ghcr.io/sdr-enthusiasts/docker-fr24feed:latest
+    container_name: fr24
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      FR24KEY: ${FR24_KEY}
+      MLAT: "yes"
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}
+      TZ: ${FEEDER_TZ}
+
+  # ─── ADSBExchange ────────────────────────────────────────────────
+  adsbexchange:
+    profiles: ["adsbexchange"]
+    image: ghcr.io/sdr-enthusiasts/docker-adsbexchange:latest
+    container_name: adsbexchange
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}m
+      TZ: ${FEEDER_TZ}
+      UUID: ${ADSBX_UUID}
+
+  # ─── PlaneFinder ─────────────────────────────────────────────────
+  planefinder:
+    profiles: ["planefinder"]
+    image: ghcr.io/sdr-enthusiasts/docker-planefinder:latest
+    container_name: planefinder
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      SHARECODE: ${PLANEFINDER_SHARECODE}
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      TZ: ${FEEDER_TZ}
+
+  # ─── RadarBox ────────────────────────────────────────────────────
+  radarbox:
+    profiles: ["radarbox"]
+    image: ghcr.io/sdr-enthusiasts/docker-radarbox:latest
+    container_name: radarbox
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}m
+      TZ: ${FEEDER_TZ}
+      SHARING_KEY: ${RBFEEDER_KEY}
+
+  # ─── OpenSky Network ─────────────────────────────────────────────
+  opensky:
+    profiles: ["opensky"]
+    image: ghcr.io/sdr-enthusiasts/docker-opensky-network:latest
+    container_name: opensky
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}
+      OPENSKY_USERNAME: ${OPENSKY_USER}
+      OPENSKY_SERIAL: ${OPENSKY_SERIAL}
+      TZ: ${FEEDER_TZ}
+
+  # ─── airframes.io: 1090 MHz ─────────────────────────────────────
+  airframes-1090:
+    profiles: ["airframes-1090"]
+    image: ghcr.io/sdr-enthusiasts/docker-airframes:latest
+    container_name: airframes-1090
+    restart: unless-stopped
+    depends_on: [ultrafeeder]
+    environment:
+      BEASTHOST: ultrafeeder
+      AIRFRAMES_STATION_ID: ${AIRFRAMES_STATION_ID}
+      AIRFRAMES_FEEDER_KEY: ${AIRFRAMES_FEEDER_KEY}
+      LAT: ${FEEDER_LAT}
+      LONG: ${FEEDER_LON}
+      ALT: ${FEEDER_ALT_M}
+      TZ: ${FEEDER_TZ}
+
+  # ─── airframes.io: VDL2 ──────────────────────────────────────────
+  # Reads dumpvdl2's JSON output (running in the `vdl2` profile) and
+  # forwards to airframes.io.  Only useful when both `vdl2` and
+  # `airframes-vdl2` profiles are enabled.
+  airframes-vdl2:
+    profiles: ["airframes-vdl2"]
+    image: ghcr.io/sdr-enthusiasts/acars_router:latest
+    container_name: airframes-vdl2
+    restart: unless-stopped
+    depends_on: [vdl2]
+    environment:
+      AR_RECV_VDLM2_TCP: vdl2:5555
+      AR_SEND_VDLM2_AIRFRAMES_IO: "true"
+      AR_AIRFRAMES_STATION_ID: ${AIRFRAMES_STATION_ID}
+      TZ: ${FEEDER_TZ}
+
+volumes:
+  ultrafeeder_globe_history:
+  ultrafeeder_graphs1090:
+  skywatch_edge_spool:
