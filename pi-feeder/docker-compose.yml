@@ -194,7 +194,7 @@ services:
   # ─── FlightRadar24 ───────────────────────────────────────────────
   fr24:
     profiles: ["fr24"]
-    image: ghcr.io/sdr-enthusiasts/docker-fr24feed:latest
+    image: ghcr.io/sdr-enthusiasts/docker-flightradar24:latest
     container_name: fr24
     restart: unless-stopped
     depends_on: [ultrafeeder]

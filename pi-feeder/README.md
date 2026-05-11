@@ -17,7 +17,7 @@ runs on a fresh Raspberry Pi OS Lite install and:
   Dockerfile from `docker/dumpvdl2/` in this repo).
 * Fans the BEAST stream out to any/all of:
   * **FlightAware** (PiAware)
-  * **FlightRadar24** (fr24feed)
+  * **FlightRadar24** (flightradar24)
   * **ADSBExchange**
   * **PlaneFinder**
   * **RadarBox**

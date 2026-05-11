@@ -81,7 +81,7 @@ chown -R pi:pi /opt/skywatch
 #    user's home Wi-Fi.
 docker pull ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest
 docker pull ghcr.io/sdr-enthusiasts/docker-piaware:latest
-docker pull ghcr.io/sdr-enthusiasts/docker-fr24feed:latest
+docker pull ghcr.io/sdr-enthusiasts/docker-flightradar24:latest
 docker pull ghcr.io/sdr-enthusiasts/docker-adsbexchange:latest
 docker pull ghcr.io/sdr-enthusiasts/docker-planefinder:latest
 docker pull ghcr.io/sdr-enthusiasts/docker-radarbox:latest
